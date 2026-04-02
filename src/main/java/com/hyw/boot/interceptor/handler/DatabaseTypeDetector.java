@@ -77,61 +77,32 @@ public class DatabaseTypeDetector {
     }
 
     /**
-     * 从不同类型的数据源中获取JDBC URL
+     * 从不同类型的数据源中获取JDBC URL（统一反射策略，避免重复分支）
      */
     private String getJdbcUrlFromDataSource(javax.sql.DataSource dataSource) {
-        try {
-            // 支持HikariDataSource（使用反射避免依赖）
-            if (dataSource.getClass().getName().equals("com.zaxxer.hikari.HikariDataSource")) {
-                Method getJdbcUrlMethod = dataSource.getClass().getMethod("getJdbcUrl");
-                return (String) getJdbcUrlMethod.invoke(dataSource);
-            }
-            // 支持Tomcat JDBC DataSource
-            else if (dataSource.getClass().getName().equals("org.apache.tomcat.jdbc.pool.DataSource")) {
-                Method method = dataSource.getClass().getMethod("getUrl");
-                return (String) method.invoke(dataSource);
-            }
-            // 支持DBCP2 DataSource（使用反射避免依赖）
-            else if (dataSource.getClass().getName().equals("org.apache.commons.dbcp2.BasicDataSource")) {
-                Method getUrlMethod = dataSource.getClass().getMethod("getUrl");
-                return (String) getUrlMethod.invoke(dataSource);
-            }
-            // 支持其他数据源类型（通过反射）
-            else {
-                // 尝试通过反射获取url或jdbcUrl属性
-                try {
-                    // 尝试获取getUrl方法
-                    Method getUrlMethod = dataSource.getClass().getMethod("getUrl");
-                    return (String) getUrlMethod.invoke(dataSource);
-                } catch (Exception e) {
-                    // 尝试获取getJdbcUrl方法
-                    try {
-                        Method getJdbcUrlMethod = dataSource.getClass().getMethod("getJdbcUrl");
-                        return (String) getJdbcUrlMethod.invoke(dataSource);
-                    } catch (Exception ex) {
-                        // 尝试获取url属性
-                        try {
-                            Field urlField = dataSource.getClass().getDeclaredField("url");
-                            urlField.setAccessible(true);
-                            return (String) urlField.get(dataSource);
-                        } catch (Exception exc) {
-                            // 尝试获取jdbcUrl属性
-                            try {
-                                Field jdbcUrlField = dataSource.getClass().getDeclaredField("jdbcUrl");
-                                jdbcUrlField.setAccessible(true);
-                                return (String) jdbcUrlField.get(dataSource);
-                            } catch (Exception exce) {
-                                // 无法获取URL
-                                return null;
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("获取数据源URL失败: {}", e.getMessage());
-            return null;
+        // 依次尝试常见的 getter 方法和字段名
+        String[] methodNames = {"getJdbcUrl", "getUrl"};
+        String[] fieldNames = {"jdbcUrl", "url"};
+
+        for (String methodName : methodNames) {
+            try {
+                Method method = dataSource.getClass().getMethod(methodName);
+                String result = (String) method.invoke(dataSource);
+                if (result != null) return result;
+            } catch (Exception ignored) {}
         }
+
+        for (String fieldName : fieldNames) {
+            try {
+                Field field = dataSource.getClass().getDeclaredField(fieldName);
+                field.setAccessible(true);
+                String result = (String) field.get(dataSource);
+                if (result != null) return result;
+            } catch (Exception ignored) {}
+        }
+
+        log.debug("无法从 {} 获取JDBC URL", dataSource.getClass().getName());
+        return null;
     }
 
     /**

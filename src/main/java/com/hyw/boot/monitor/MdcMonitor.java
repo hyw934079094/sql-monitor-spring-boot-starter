@@ -7,12 +7,10 @@ import lombok.Data;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
-import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -25,32 +23,35 @@ import java.util.stream.Collectors;
  * @author hyw
  * @version 3.0.0
  */
-@Component
 public class MdcMonitor {
 
     private static final Logger log = LoggerFactory.getLogger(MdcMonitor.class);
 
     private final SlowSqlProperties properties;
-    private final Set<String> monitoredKeys;
 
     private final AtomicLong totalTaskCount = new AtomicLong(0);
     private final AtomicLong hitCount = new AtomicLong(0);
     private final AtomicLong missCount = new AtomicLong(0);
 
-    // ✅ 使用 ConcurrentHashMap 作为实现，ConcurrentMap 作为接口
     private final ConcurrentMap<String, AtomicLong> missByKey = new ConcurrentHashMap<>();
 
     public MdcMonitor(SlowSqlProperties properties) {
         this.properties = properties;
-        this.monitoredKeys = new HashSet<>(properties.getMdc().getMdcKeys());
     }
 
     @PostConstruct
     public void init() {
-        log.info("MDC监控初始化 - 监控的keys: {}, 采样率: {}, 告警阈值: {}%",
-                monitoredKeys,
+        log.debug("MDC监控初始化 - 监控的keys: {}, 采样率: {}, 告警阈值: {}%",
+                getMonitoredKeys(),
                 properties.getMdc().getMonitorRate(),
                 properties.getMdc().getAlertThreshold());
+    }
+
+    /**
+     * 动态获取监控的MDC keys（支持运行时配置刷新）
+     */
+    private List<String> getMonitoredKeys() {
+        return properties.getMdc().getMdcKeys();
     }
 
     /**
@@ -67,11 +68,10 @@ public class MdcMonitor {
         boolean allKeysPresent = true;
         Map<String, String> currentMdc = MDC.getCopyOfContextMap();
 
-        for (String key : monitoredKeys) {
+        for (String key : getMonitoredKeys()) {
             String value = currentMdc != null ? currentMdc.get(key) : null;
             if (value == null || value.isEmpty()) {
                 allKeysPresent = false;
-                // ✅ 使用 computeIfAbsent 确保线程安全
                 missByKey.computeIfAbsent(key, k -> new AtomicLong(0))
                         .incrementAndGet();
                 log.debug("MDC key丢失 - key: {}, 当前MDC: {}", key, currentMdc);
@@ -80,7 +80,7 @@ public class MdcMonitor {
 
         if (allKeysPresent) {
             hitCount.incrementAndGet();
-            log.debug("MDC所有keys传递成功 - keys: {}", monitoredKeys);
+            log.debug("MDC所有keys传递成功 - keys: {}", getMonitoredKeys());
         } else {
             long miss = missCount.incrementAndGet();
 
@@ -101,7 +101,7 @@ public class MdcMonitor {
     }
 
     /**
-     * 获取详细统计信息
+     * 获取详细统计信息（只读快照，不重置）
      */
     public MdcStats getStats() {
         Map<String, Long> missDetails = new HashMap<>();
@@ -116,13 +116,25 @@ public class MdcMonitor {
     }
 
     /**
-     * 重置统计
+     * 原子性地获取统计并重置（用于周期性报告）。
+     *
+     * <p>使用 {@code getAndSet(0)} 保证每个计数器的获取和重置是原子的，
+     * 避免 getStats() + resetStats() 两步操作之间的数据丢失。</p>
      */
-    public void resetStats() {
-        totalTaskCount.set(0);
-        hitCount.set(0);
-        missCount.set(0);
-        missByKey.clear();
+    public MdcStats getAndResetStats() {
+        long total = totalTaskCount.getAndSet(0);
+        long hit = hitCount.getAndSet(0);
+        long miss = missCount.getAndSet(0);
+
+        Map<String, Long> missDetails = new HashMap<>();
+        for (Map.Entry<String, AtomicLong> entry : missByKey.entrySet()) {
+            long val = entry.getValue().getAndSet(0);
+            if (val > 0) {
+                missDetails.put(entry.getKey(), val);
+            }
+        }
+
+        return new MdcStats(total, hit, miss, missDetails);
     }
 
     @Data
@@ -133,8 +145,12 @@ public class MdcMonitor {
         private long miss;
         private Map<String, Long> missByKey;
 
+        /**
+         * 计算采样命中率（基于采样总数，非全量任务数）
+         */
         public double getHitRate() {
-            return total == 0 ? 100.0 : (hit * 100.0 / total);
+            long sampled = hit + miss;
+            return sampled == 0 ? 100.0 : (hit * 100.0 / sampled);
         }
 
         public String getMissDetails() {

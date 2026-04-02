@@ -1,7 +1,9 @@
 package com.hyw.boot.parser;
 
-import com.hyw.boot.parser.JSqlParser.SqlParseResult;
+import lombok.Data;
+import net.sf.jsqlparser.statement.Statement;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -51,4 +53,21 @@ public interface SqlParser {
      * @return true如果是DML操作
      */
     boolean isDml(String sql);
+
+    /**
+     * SQL解析结果
+     */
+    @Data
+    class SqlParseResult {
+        private String originalSql;
+        private Statement statement;
+        private String sqlType;
+        private List<String> tables = new ArrayList<>();
+        private List<String> columns = new ArrayList<>();
+        private String whereCondition;
+        private String orderBy;
+        private String limit;
+        private boolean hasJoin;
+        private boolean hasSubQuery;
+    }
 }

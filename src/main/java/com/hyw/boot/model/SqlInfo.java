@@ -27,4 +27,7 @@ public class SqlInfo {
     private boolean hasJoin;
     private boolean hasSubQuery;
     private String error;
+    private String dbType;
+    private String traceId;
+    private String userId;
 }

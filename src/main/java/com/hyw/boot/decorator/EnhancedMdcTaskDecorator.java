@@ -7,9 +7,8 @@ import org.slf4j.MDC;
 import org.springframework.core.task.TaskDecorator;
 
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * 增强版MDC传递装饰器
@@ -22,20 +21,21 @@ public class EnhancedMdcTaskDecorator implements TaskDecorator {
     private static final Logger log = LoggerFactory.getLogger(EnhancedMdcTaskDecorator.class);
 
     private final SlowSqlProperties properties;
-    private final Set<String> mdcKeys;
 
     public EnhancedMdcTaskDecorator(SlowSqlProperties properties) {
         this.properties = properties;
-        this.mdcKeys = new HashSet<>(properties.getMdc().getMdcKeys());
 
-        log.info("MDC装饰器初始化 - 监控的MDC keys: {}, MDC监控采样率: {}, 告警阈值: {}%",
-                mdcKeys,
+        log.debug("MDC装饰器初始化 - 监控的MDC keys: {}, MDC监控采样率: {}, 告警阈值: {}%",
+                properties.getMdc().getMdcKeys(),
                 properties.getMdc().getMonitorRate(),
                 properties.getMdc().getAlertThreshold());
     }
 
     @Override
     public Runnable decorate(Runnable runnable) {
+        // 动态获取配置的MDC keys（支持运行时刷新）
+        List<String> mdcKeys = properties.getMdc().getMdcKeys();
+
         // 捕获当前线程的MDC上下文
         Map<String, String> context = new HashMap<>();
         for (String key : mdcKeys) {
@@ -51,7 +51,7 @@ public class EnhancedMdcTaskDecorator implements TaskDecorator {
             log.debug("捕获MDC上下文 - keys: {}, traceId: {}", context.keySet(), traceId);
         }
 
-        return new MdcAwareRunnable(runnable, context, traceId, properties);
+        return new MdcAwareRunnable(runnable, context, traceId);
     }
 
     /**
@@ -62,26 +62,29 @@ public class EnhancedMdcTaskDecorator implements TaskDecorator {
         private final Map<String, String> context;
         private final String traceId;
         private final long createTime;
-        private final SlowSqlProperties properties;
 
         public MdcAwareRunnable(Runnable delegate, Map<String, String> context,
-                                String traceId, SlowSqlProperties properties) {
+                                String traceId) {
             this.delegate = delegate;
             this.context = context;
             this.traceId = traceId;
             this.createTime = System.currentTimeMillis();
-            this.properties = properties;
         }
 
         @Override
         public void run() {
             long queueTime = System.currentTimeMillis() - createTime;
 
-            if (context != null && !context.isEmpty()) {
-                MDC.setContextMap(new HashMap<>(context));
-            }
+            // 保存异步线程原有的MDC上下文
+            Map<String, String> previousContext = MDC.getCopyOfContextMap();
 
             try {
+                // 逐个设置，不覆盖其他框架/装饰器设置的MDC值
+                if (context != null) {
+                    for (Map.Entry<String, String> entry : context.entrySet()) {
+                        MDC.put(entry.getKey(), entry.getValue());
+                    }
+                }
                 MDC.put("async.queue.time", String.valueOf(queueTime));
 
                 if (log.isDebugEnabled() && traceId != null) {
@@ -92,7 +95,12 @@ public class EnhancedMdcTaskDecorator implements TaskDecorator {
                 delegate.run();
 
             } finally {
-                MDC.clear();
+                // 恢复异步线程原有的MDC上下文，而非直接清除
+                if (previousContext != null) {
+                    MDC.setContextMap(previousContext);
+                } else {
+                    MDC.clear();
+                }
             }
         }
     }

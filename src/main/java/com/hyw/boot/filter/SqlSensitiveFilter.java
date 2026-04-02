@@ -4,7 +4,6 @@ import com.hyw.boot.config.SlowSqlProperties;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.util.Objects;
@@ -18,7 +17,6 @@ import java.util.stream.Collectors;
  * @author hyw
  * @version 3.0.0
  */
-@Component
 public class SqlSensitiveFilter {
 
     private static final Logger log = LoggerFactory.getLogger(SqlSensitiveFilter.class);
@@ -31,7 +29,6 @@ public class SqlSensitiveFilter {
     private final Pattern phonePattern = Pattern.compile("(1[3-9]\\d{9})");
     private final Pattern idCardPattern = Pattern.compile("[1-9]\\d{5}(19|20)\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])\\d{3}[\\dXx]");
 
-    // 完全适配你的构造器
     public SqlSensitiveFilter(SlowSqlProperties properties) {
         this.properties = properties;
     }
@@ -40,8 +37,8 @@ public class SqlSensitiveFilter {
      * 初始化正则（启动时执行一次）
      */
     @PostConstruct
-    private void initPattern() {
-        log.info("=== SQL脱敏过滤器初始化开始 ===");
+    public void initPattern() {
+        log.debug("=== SQL脱敏过滤器初始化开始 ===");
 
         SlowSqlProperties.SensitiveConfig sensitive = properties.getSensitive();
 
@@ -49,26 +46,28 @@ public class SqlSensitiveFilter {
             return;
         }
 
-        // 敏感字段正则（支持单引号/双引号）
+        // 敏感字段正则（支持单引号/双引号），统一使用 CASE_INSENSITIVE 标志
         String fieldRegex = sensitive.getSensitiveFields()
                 .stream()
-                .map(f -> "(?i)" + Pattern.quote(f))
+                .map(Pattern::quote)
                 .collect(Collectors.joining("|"));
 
         this.sensitiveFieldPattern = Pattern.compile(
-                "(" + fieldRegex + ")\\s*=\\s*(['\"])(.*?)\\2"
+                "(" + fieldRegex + ")\\s*=\\s*(['\"])(.*?)\\2",
+                Pattern.CASE_INSENSITIVE
         );
 
         // 敏感表正则
         String tableRegex = sensitive.getSensitiveTables()
                 .stream()
-                .map(t -> "(?i)" + Pattern.quote(t))
+                .map(Pattern::quote)
                 .collect(Collectors.joining("|"));
 
         this.sensitiveTablePattern = Pattern.compile(
-                "\\b(from|into|update|join)\\s+(" + tableRegex + ")\\b"
+                "\\b(from|into|update|join)\\s+(" + tableRegex + ")\\b",
+                Pattern.CASE_INSENSITIVE
         );
-        log.info("=== SQL脱敏过滤器初始化完成 ===");
+        log.debug("=== SQL脱敏过滤器初始化完成 ===");
     }
 
     /**
@@ -87,7 +86,7 @@ public class SqlSensitiveFilter {
             String filtered;
 
             if (isSensitiveTable) {
-                log.info("检测到敏感表操作，执行全脱敏");
+                log.debug("检测到敏感表操作，执行全脱敏");
                 filtered = maskSensitiveTableData(sql);
             } else {
                 filtered = filterSensitiveFields(sql);
@@ -96,7 +95,7 @@ public class SqlSensitiveFilter {
             }
 
             if (!sql.equals(filtered)) {
-                log.info("SQL脱敏完成：{}", filtered);
+                log.debug("SQL脱敏完成：{}", filtered);
             }
 
             return filtered;
@@ -117,19 +116,20 @@ public class SqlSensitiveFilter {
     }
 
     /**
-     * 敏感字段脱敏：password=xxx → password=****
+     * 敏感字段脱敏：password='xxx' → password='****'
      */
     private String filterSensitiveFields(String sql) {
         if (sensitiveFieldPattern == null) return sql;
 
         Matcher matcher = sensitiveFieldPattern.matcher(sql);
-        StringBuffer sb = new StringBuffer();
+        StringBuilder sb = new StringBuilder();
 
         while (matcher.find()) {
             String field = matcher.group(1);
+            String quote = matcher.group(2);
             String value = matcher.group(3);
             String masked = maskValue(value);
-            matcher.appendReplacement(sb, field + "='" + masked + "'");
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(field + "=" + quote + masked + quote));
         }
         matcher.appendTail(sb);
         return sb.toString();
@@ -144,10 +144,17 @@ public class SqlSensitiveFilter {
     }
 
     /**
-     * 敏感表全脱敏
+     * 敏感表全脱敏：对 VALUES、SET、WHERE 中的值进行脱敏
      */
     private String maskSensitiveTableData(String sql) {
-        return sql.replaceAll("(?i)values\\s*\\([^)]*\\)", "values(***)");
+        String result = sql;
+        // INSERT VALUES 脱敏
+        result = result.replaceAll("(?i)values\\s*\\([^)]*\\)", "values(***)");
+        // SET 子句中的值脱敏
+        result = result.replaceAll("(?i)set\\s+(.+?)(?=\\s+where|$)", "SET ***");
+        // WHERE 条件中的字面值脱敏
+        result = result.replaceAll("=\\s*(['\"]).*?\\1", "='***'");
+        return result;
     }
 
     /**
@@ -155,11 +162,11 @@ public class SqlSensitiveFilter {
      */
     private String filterPhoneNumbers(String sql) {
         Matcher matcher = phonePattern.matcher(sql);
-        StringBuffer sb = new StringBuffer();
+        StringBuilder sb = new StringBuilder();
         while (matcher.find()) {
             String phone = matcher.group();
             String masked = phone.substring(0, 3) + "****" + phone.substring(7);
-            matcher.appendReplacement(sb, masked);
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(masked));
         }
         matcher.appendTail(sb);
         return sb.toString();
@@ -170,11 +177,11 @@ public class SqlSensitiveFilter {
      */
     private String filterIdCards(String sql) {
         Matcher matcher = idCardPattern.matcher(sql);
-        StringBuffer sb = new StringBuffer();
+        StringBuilder sb = new StringBuilder();
         while (matcher.find()) {
             String id = matcher.group();
             String masked = id.substring(0, 6) + "********" + id.substring(14);
-            matcher.appendReplacement(sb, masked);
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(masked));
         }
         matcher.appendTail(sb);
         return sb.toString();
@@ -187,12 +194,16 @@ public class SqlSensitiveFilter {
         if (!StringUtils.hasText(value)) return "****";
 
         int maskLength = properties.getSensitive().getMaskLength();
-        if (value.length() <= maskLength) {
-            return "****";
+        String maskChar = properties.getSensitive().getMaskChar();
+        String mask = maskChar.repeat(4);
+
+        if (value.length() <= maskLength * 2) {
+            // 值太短，无法同时展示前后缀，直接全部脱敏
+            return mask;
         }
 
         String prefix = value.substring(0, maskLength);
         String suffix = value.substring(value.length() - maskLength);
-        return prefix + "****" + suffix;
+        return prefix + mask + suffix;
     }
 }

@@ -5,6 +5,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.hash.Hashing;
 import com.hyw.boot.config.SlowSqlProperties;
 import com.hyw.boot.filter.SqlSensitiveFilter;
+import com.hyw.boot.handler.SlowSqlHandler;
 import com.hyw.boot.interceptor.handler.DatabaseTypeDetector;
 import com.hyw.boot.interceptor.handler.SqlInfoExtractor;
 import com.hyw.boot.interceptor.handler.SqlMetricsHandler;
@@ -17,88 +18,179 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
-import java.nio.charset.StandardCharsets;
-import java.util.Collection;
-import java.util.Map;
-import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 import org.apache.ibatis.cache.CacheKey;
 import org.apache.ibatis.executor.Executor;
 import org.apache.ibatis.mapping.BoundSql;
 import org.apache.ibatis.mapping.MappedStatement;
-import org.apache.ibatis.plugin.Interceptor;
-import org.apache.ibatis.plugin.Intercepts;
-import org.apache.ibatis.plugin.Invocation;
-import org.apache.ibatis.plugin.Plugin;
-import org.apache.ibatis.plugin.Signature;
+import org.apache.ibatis.plugin.*;
 import org.apache.ibatis.session.ResultHandler;
 import org.apache.ibatis.session.RowBounds;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.MDC;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.ApplicationContext;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-import org.springframework.stereotype.Component;
 
-@Component
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * 慢SQL监控拦截器
+ *
+ * <p>基于 MyBatis {@link Interceptor} 实现，拦截 Executor 的 query/update 方法，
+ * 异步记录慢 SQL 指标，不阻塞业务主链路。</p>
+ *
+ * <p>MDC 上下文传递由 {@link com.hyw.boot.decorator.EnhancedMdcTaskDecorator} 统一负责，
+ * 本类不再手动管理异步线程的 MDC，避免双重管理导致的上下文覆盖问题。</p>
+ *
+ * @author hyw
+ * @version 3.0.0
+ */
 @Intercepts({
-        @Signature(
-                type = Executor.class,
-                method = "update",
-                args = {MappedStatement.class, Object.class}
-        ),
-        @Signature(
-                type = Executor.class,
-                method = "query",
-                args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class}
-        ),
-        @Signature(
-                type = Executor.class,
-                method = "query",
-                args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class, CacheKey.class, BoundSql.class}
-        )
+        @Signature(type = Executor.class, method = "update",
+                args = {MappedStatement.class, Object.class}),
+        @Signature(type = Executor.class, method = "query",
+                args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class}),
+        @Signature(type = Executor.class, method = "query",
+                args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class, CacheKey.class, BoundSql.class})
 })
 public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperties.ConfigChangeListener {
+
     private static final Logger log = LoggerFactory.getLogger(UniversalSlowSqlInterceptor.class);
+
+    /** 未能获取 sqlId 时的占位符，避免 null 字符串出现在日志和缓存 key 中 */
+    private static final String UNKNOWN_SQL_ID = "unknown";
+
+    /** Murmur3 hash 无符号最大值，用于归一化采样概率 */
+    private static final double MURMUR3_MAX_UNSIGNED = 4_294_967_295.0;
+
+    /** 熔断触发阈值：连续失败次数 */
+    private static final int CIRCUIT_BREAKER_THRESHOLD = 10;
+    /** 熔断恢复等待时间（ms） */
+    private static final long CIRCUIT_BREAKER_RECOVERY_MS = 60_000;
+
+    // ====== 依赖 ======
     private final SlowSqlProperties properties;
     private final SqlSensitiveFilter sensitiveFilter;
     private final SqlParser sqlParser;
-    private final MeterRegistry meterRegistry;
-    private final ApplicationContext applicationContext;
+    private final MeterRegistry meterRegistry;      // 可为 null（micrometer 未引入时）
+    private final ApplicationContext applicationContext; // 可为 null
     private final ThreadPoolTaskExecutor asyncExecutor;
     private final MdcMonitor mdcMonitor;
-    private final Cache<String, Boolean> sampleCache;
+    private final List<SlowSqlHandler> slowSqlHandlers;
+
+    // ====== 熔断器状态 ======
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    private volatile boolean degradedMode = false;
+    private volatile long degradedSince = 0;
+
+    // ====== Caffeine 缓存 ======
+    /** Micrometer Timer 缓存，key = sqlId */
     private final Cache<String, Timer> timerCache;
+    /** Micrometer Counter 缓存，key = sqlId */
     private final Cache<String, Counter> counterCache;
+    /**
+     * 采样结果缓存，key = sqlId。
+     *
+     * <p>同一 sqlId 的采样结果是确定性的（基于 Murmur3 hash），
+     * 因此无需在 key 中拼接 sampleRate；sampleRate 变更时直接
+     * {@code invalidateAll()} 即可。</p>
+     */
+    private final Cache<String, Boolean> sampleCache;
+
+    // ====== 延迟初始化（PostConstruct 中赋值）======
     private SqlInfoExtractor sqlInfoExtractor;
     private SqlMetricsHandler sqlMetricsHandler;
     private DatabaseTypeDetector databaseTypeDetector;
     private SqlMonitorScheduler sqlMonitorScheduler;
 
-    public UniversalSlowSqlInterceptor(SlowSqlProperties properties, SqlSensitiveFilter sensitiveFilter, SqlParser sqlParser, @Autowired(required = false) MeterRegistry meterRegistry, @Autowired(required = false) ApplicationContext applicationContext, @Qualifier("sqlMonitorExecutor") ThreadPoolTaskExecutor asyncExecutor, @Autowired(required = false) MdcMonitor mdcMonitor) {
+    // ====================================================================
+    // 构造器
+    // ====================================================================
+
+    public UniversalSlowSqlInterceptor(
+            SlowSqlProperties properties,
+            SqlSensitiveFilter sensitiveFilter,
+            SqlParser sqlParser,
+            MeterRegistry meterRegistry,
+            ApplicationContext applicationContext,
+            ThreadPoolTaskExecutor asyncExecutor,
+            MdcMonitor mdcMonitor,
+            List<SlowSqlHandler> slowSqlHandlers) {
+
         this.properties = properties;
         this.sensitiveFilter = sensitiveFilter;
         this.sqlParser = sqlParser;
         this.meterRegistry = meterRegistry;
         this.applicationContext = applicationContext;
         this.asyncExecutor = asyncExecutor;
+        // mdcMonitor 未注入时创建默认实例，保证后续调用安全
         this.mdcMonitor = mdcMonitor != null ? mdcMonitor : new MdcMonitor(properties);
-        this.timerCache = Caffeine.newBuilder().maximumSize((long)properties.getMaxCacheSize()).expireAfterAccess(30L, TimeUnit.MINUTES).build();
-        this.counterCache = Caffeine.newBuilder().maximumSize((long)properties.getMaxCacheSize()).expireAfterAccess(30L, TimeUnit.MINUTES).build();
-        this.sampleCache = Caffeine.newBuilder().maximumSize((long)Math.min(properties.getMaxCacheSize() * 5, 5000)).expireAfterWrite(30L, TimeUnit.MINUTES).build();
+        this.slowSqlHandlers = slowSqlHandlers != null ? slowSqlHandlers : Collections.emptyList();
+
+        int maxCacheSize = properties.getMaxCacheSize();
+        this.timerCache = Caffeine.newBuilder()
+                .maximumSize(maxCacheSize)
+                .expireAfterAccess(30, TimeUnit.MINUTES)
+                .build();
+        this.counterCache = Caffeine.newBuilder()
+                .maximumSize(maxCacheSize)
+                .expireAfterAccess(30, TimeUnit.MINUTES)
+                .build();
+        this.sampleCache = Caffeine.newBuilder()
+                .maximumSize(Math.min(maxCacheSize * 5L, 5_000))
+                .expireAfterWrite(30, TimeUnit.MINUTES)
+                .build();
     }
 
+    // ====================================================================
+    // 生命周期
+    // ====================================================================
+
+    /**
+     * 初始化内部组件。
+     *
+     * <p><b>重要：</b>{@link DatabaseTypeDetector} 必须先于 {@link SqlInfoExtractor}
+     * 初始化，因为后者在构造时持有前者的引用。</p>
+     */
     @PostConstruct
     public void init() {
-        this.properties.addListener(this);
-        this.sqlInfoExtractor = new SqlInfoExtractor(this.sensitiveFilter, this.sqlParser, this.properties.getMaxSqlLength());
-        this.sqlMetricsHandler = new SqlMetricsHandler(this.properties, this.meterRegistry, this.timerCache, this.counterCache, this.sampleCache);
-        this.databaseTypeDetector = new DatabaseTypeDetector(this.applicationContext, this.properties.getDbTypeCacheSeconds());
-        this.sqlMonitorScheduler = new SqlMonitorScheduler(this.timerCache, this.counterCache, this.sampleCache, this.properties.getMaxCacheSize());
+        // 1. 先初始化 databaseTypeDetector
+        this.databaseTypeDetector = new DatabaseTypeDetector(
+                this.applicationContext,
+                this.properties.getDbTypeCacheSeconds()
+        );
+
+        // 2. 再初始化依赖 databaseTypeDetector 的 sqlInfoExtractor
+        this.sqlInfoExtractor = new SqlInfoExtractor(
+                this.sensitiveFilter,
+                this.sqlParser,
+                this.properties.getMaxSqlLength(),
+                this.databaseTypeDetector
+        );
+
+        // 3. 其余组件
+        this.sqlMetricsHandler = new SqlMetricsHandler(
+                this.properties, this.meterRegistry,
+                this.timerCache, this.counterCache, this.slowSqlHandlers
+        );
+        this.sqlMonitorScheduler = new SqlMonitorScheduler(
+                this.timerCache, this.counterCache,
+                this.sampleCache, this.properties.getMaxCacheSize()
+        );
         this.sqlMonitorScheduler.start();
-        log.info("慢SQL监控初始化完成 - 线程池: core={}, max={}, queue={}, MDC监控={}", new Object[]{this.properties.getPool().getCoreSize(), this.properties.getPool().getMaxSize(), this.properties.getPool().getQueueCapacity(), this.properties.getMdc().isEnabled()});
+
+        // 4. 注册配置变更监听
+        this.properties.addListener(this);
+
+        log.info("慢SQL监控初始化完成 - 线程池: core={}, max={}, queue={}, MDC监控={}",
+                this.properties.getPool().getCoreSize(),
+                this.properties.getPool().getMaxSize(),
+                this.properties.getPool().getQueueCapacity(),
+                this.properties.getMdc().isEnabled());
     }
 
     @PreDestroy
@@ -107,138 +199,195 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
         if (this.sqlMonitorScheduler != null) {
             this.sqlMonitorScheduler.stop();
         }
-
         this.timerCache.invalidateAll();
         this.counterCache.invalidateAll();
         this.sampleCache.invalidateAll();
         log.info("慢SQL监控资源已释放");
     }
 
+    // ====================================================================
+    // MyBatis Interceptor 接口实现
+    // ====================================================================
+
+    @Override
     public Object intercept(Invocation invocation) throws Throwable {
         if (!this.properties.isEnabled()) {
             return invocation.proceed();
-        } else {
-            long start = System.nanoTime();
-            String sqlId = null;
-            String methodName = invocation.getMethod().getName();
-
-            Object var14;
-            try {
-                MappedStatement mappedStatement = (MappedStatement)invocation.getArgs()[0];
-                sqlId = mappedStatement.getId();
-                this.sqlMonitorScheduler.incrementTotalCount();
-
-                // 移除 batch 相关逻辑
-                Object result = invocation.proceed();
-                long cost = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-                Map<String, String> currentContext = MDC.getCopyOfContextMap();
-                String currentTraceId = MDC.get("traceId");
-                String finalSqlId = sqlId;
-                this.asyncExecutor.submit(() -> {
-                    try {
-                        this.processSqlMetricsWithMdc(invocation, finalSqlId, cost, (Exception)null, methodName, currentContext, currentTraceId);
-                    } catch (Exception e) {
-                        log.error("异步处理SQL指标失败: {}", e.getMessage(), e);
-                    }
-
-                });
-                var14 = result;
-            } catch (Exception e) {
-                long cost = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-                Map<String, String> currentContext = MDC.getCopyOfContextMap();
-                String currentTraceId = MDC.get("traceId");
-                String finalSqlId1 = sqlId;
-                this.asyncExecutor.submit(() -> {
-                    try {
-                        this.processSqlMetricsWithMdc(invocation, finalSqlId1, cost, e, methodName, currentContext, currentTraceId);
-                    } catch (Exception ex) {
-                        log.error("异步处理SQL异常指标失败: {}", ex.getMessage(), ex);
-                    }
-
-                });
-                throw e;
-            } finally {
-                // 移除 batch 相关 MDC
-            }
-
-            return var14;
         }
-    }
 
-    private void processSqlMetricsWithMdc(Invocation invocation, String sqlId, long cost, Exception error, String methodName, Map<String, String> context, String traceId) {
-        if (context != null && !context.isEmpty()) {
-            MDC.setContextMap(context);
-        }
+        long start = System.nanoTime();
+        // 默认值 "unknown"，防止后续拼接产生 "null" 字符串
+        String sqlId = UNKNOWN_SQL_ID;
+        String methodName = invocation.getMethod().getName();
 
         try {
-            if (this.mdcMonitor != null && this.properties.getMdc().isEnabled()) {
-                this.mdcMonitor.recordMdcStatus();
-            }
+            MappedStatement mappedStatement = (MappedStatement) invocation.getArgs()[0];
+            sqlId = mappedStatement.getId();
+            this.sqlMonitorScheduler.incrementTotalCount();
 
-            this.processSqlMetrics(invocation, sqlId, cost, error, methodName);
-        } finally {
-            MDC.clear();
-        }
+            Object result = invocation.proceed();
 
-    }
+            long cost = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            submitMetricsTask(invocation, sqlId, cost, null, methodName);
+            return result;
 
-    private void processSqlMetrics(Invocation invocation, String sqlId, long cost, Exception error, String methodName) {
-        try {
-            SqlInfo sqlInfo = null;
-            boolean needDetail = cost > this.properties.getSlowThreshold() || this.shouldSample(sqlId) || this.meterRegistry != null;
-            if (needDetail) {
-                sqlInfo = this.sqlInfoExtractor.extractSqlInfo(invocation);
-            }
-
-            if (cost > this.properties.getSlowThreshold()) {
-                this.sqlMonitorScheduler.incrementSlowCount();
-                if (cost > this.properties.getCriticalThreshold()) {
-                    this.sqlMonitorScheduler.incrementCriticalCount();
-                }
-            }
-
-            if (sqlInfo != null) {
-                this.sqlMetricsHandler.handleSqlMetrics(sqlInfo, sqlId, cost, error, methodName);
-            }
         } catch (Exception e) {
-            log.error("处理SQL指标失败 - sqlId: {}, error: {}", new Object[]{sqlId, e.getMessage(), e});
-        }
-
-    }
-
-    private boolean shouldSample(String sqlId) {
-        if (!this.properties.isLogEnabled()) {
-            return false;
-        } else {
-            double rate = this.properties.getSampleRate();
-            if (rate >= (double)1.0F) {
-                return true;
-            } else if (rate <= (double)0.0F) {
-                return false;
-            } else {
-                String cacheKey = sqlId + ":" + String.format("%.6f", rate);
-                return (Boolean)this.sampleCache.get(cacheKey, (key) -> {
-                    int hash = Hashing.murmur3_32().hashString(sqlId, StandardCharsets.UTF_8).asInt();
-                    long unsignedHash = (long)hash & 4294967295L;
-                    return (double)unsignedHash / (double)4.2949673E9F < rate ? true : false;
-                });
-            }
+            long cost = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            submitMetricsTask(invocation, sqlId, cost, e, methodName);
+            throw e;
         }
     }
 
+    @Override
     public Object plugin(Object target) {
         return Plugin.wrap(target, this);
     }
 
+    @Override
     public void setProperties(Properties properties) {
         this.properties.mergeProperties(properties);
     }
 
-    public void onConfigChange(SlowSqlProperties.SlowSqlConfigSnapshot oldConfig, SlowSqlProperties.SlowSqlConfigSnapshot newConfig) {
+    // ====================================================================
+    // 配置变更监听
+    // ====================================================================
+
+    @Override
+    public void onConfigChange(
+            SlowSqlProperties.SlowSqlConfigSnapshot oldConfig,
+            SlowSqlProperties.SlowSqlConfigSnapshot newConfig) {
+
+        // sampleRate 变更时，采样缓存全部失效，使新 rate 立即生效
         if (oldConfig.getSampleRate() != newConfig.getSampleRate()) {
             this.sampleCache.invalidateAll();
+            log.info("采样率已变更 ({} -> {})，采样缓存已清空",
+                    oldConfig.getSampleRate(), newConfig.getSampleRate());
         }
 
-        log.info("配置已更新 - sampleRate: {} -> {}, slowThreshold: {}ms -> {}ms", new Object[]{oldConfig.getSampleRate(), newConfig.getSampleRate(), oldConfig.getSlowThreshold(), newConfig.getSlowThreshold()});
+        log.info("慢SQL配置已更新 - sampleRate: {} -> {}, slowThreshold: {}ms -> {}ms",
+                oldConfig.getSampleRate(), newConfig.getSampleRate(),
+                oldConfig.getSlowThreshold(), newConfig.getSlowThreshold());
+    }
+
+    // ====================================================================
+    // 私有方法
+    // ====================================================================
+
+    /**
+     * 将指标处理任务提交到异步线程池。
+     *
+     * <p>MDC 上下文传递由 asyncExecutor 上配置的 {@link com.hyw.boot.decorator.EnhancedMdcTaskDecorator}
+     * 统一负责，无需在此手动快照和恢复 MDC。</p>
+     */
+    private void submitMetricsTask(
+            Invocation invocation, String sqlId, long cost,
+            Exception error, String methodName) {
+
+        try {
+            this.asyncExecutor.submit(() -> {
+                try {
+                    if (this.properties.getMdc().isEnabled()) {
+                        this.mdcMonitor.recordMdcStatus();
+                    }
+                    processSqlMetrics(invocation, sqlId, cost, error, methodName);
+                } catch (Exception ex) {
+                    log.error("异步处理SQL指标失败 - sqlId: {}, error: {}", sqlId, ex.getMessage(), ex);
+                }
+            });
+        } catch (org.springframework.core.task.TaskRejectedException e) {
+            // 线程池队列已满，丢弃监控任务而非阻塞业务线程
+            this.sqlMonitorScheduler.incrementRejectedCount();
+        }
+    }
+
+    /**
+     * 核心指标处理逻辑。
+     *
+     * <p>按需提取 SQL 详情（避免每次都解析 SQL 带来的性能开销）：
+     * 仅在以下情况提取：超过慢 SQL 阈值、命中采样、或需要上报 Micrometer 指标。</p>
+     */
+    private void processSqlMetrics(
+            Invocation invocation, String sqlId, long cost,
+            Exception error, String methodName) {
+
+        // 慢SQL计数始终执行（不受熔断影响）
+        if (cost > this.properties.getSlowThreshold()) {
+            this.sqlMonitorScheduler.incrementSlowCount();
+            if (cost > this.properties.getCriticalThreshold()) {
+                this.sqlMonitorScheduler.incrementCriticalCount();
+            }
+        }
+
+        // 熔断检查：降级模式下跳过SQL解析/脱敏/指标上报，仅保留计数
+        if (this.degradedMode) {
+            if (System.currentTimeMillis() - this.degradedSince > CIRCUIT_BREAKER_RECOVERY_MS) {
+                this.degradedMode = false;
+                this.consecutiveFailures.set(0);
+                log.info("熔断恢复，恢复完整SQL监控");
+            } else {
+                return;
+            }
+        }
+
+        try {
+            boolean needDetail = cost > this.properties.getSlowThreshold()
+                    || this.shouldSample(sqlId)
+                    || this.meterRegistry != null;
+
+            SqlInfo sqlInfo = needDetail
+                    ? this.sqlInfoExtractor.extractSqlInfo(invocation)
+                    : null;
+
+            if (sqlInfo != null) {
+                this.sqlMetricsHandler.handleSqlMetrics(sqlInfo, sqlId, cost, error, methodName);
+            }
+
+            // 成功处理，重置连续失败计数
+            this.consecutiveFailures.set(0);
+
+        } catch (Exception e) {
+            int failures = this.consecutiveFailures.incrementAndGet();
+            if (failures >= CIRCUIT_BREAKER_THRESHOLD && !this.degradedMode) {
+                // 顺序关键：先设时间戳再设标志，防止其他线程看到 degradedMode=true 但 degradedSince=0 导致立即恢复
+                this.degradedSince = System.currentTimeMillis();
+                this.degradedMode = true;
+                log.error("SQL监控连续失败 {} 次，触发熔断降级（仅计时模式），将在 {}s 后尝试恢复",
+                        failures, CIRCUIT_BREAKER_RECOVERY_MS / 1000);
+            } else {
+                log.error("处理SQL指标失败 ({}/{}) - sqlId: {}, error: {}",
+                        failures, CIRCUIT_BREAKER_THRESHOLD, sqlId, e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * 基于 Murmur3 Hash 的确定性采样判断。
+     *
+     * <p>同一 sqlId 在 sampleRate 不变的情况下，采样结果恒定，
+     * 避免随机采样导致同一条 SQL 时记时不记的问题。
+     * 结果缓存在 {@code sampleCache} 中，sampleRate 变更时缓存会被
+     * {@link #onConfigChange} 清空。</p>
+     *
+     * @param sqlId MyBatis MappedStatement ID
+     * @return 是否应采样该条 SQL
+     */
+    private boolean shouldSample(String sqlId) {
+        if (!this.properties.isLogEnabled()) {
+            return false;
+        }
+
+        double rate = this.properties.getSampleRate();
+        if (rate >= 1.0) return true;
+        if (rate <= 0.0) return false;
+
+        // key 只用 sqlId，sampleRate 变更时通过 invalidateAll() 使缓存失效
+        return Boolean.TRUE.equals(this.sampleCache.get(sqlId, key -> {
+            int hash = Hashing.murmur3_32_fixed()
+                    .hashString(key, StandardCharsets.UTF_8)
+                    .asInt();
+            // 转为无符号长整型后归一化到 [0, 1)
+            long unsignedHash = Integer.toUnsignedLong(hash);
+            return (double) unsignedHash / MURMUR3_MAX_UNSIGNED < rate;
+        }));
     }
 }

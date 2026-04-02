@@ -21,14 +21,14 @@ public class SqlMonitorScheduler {
     private final LongAdder totalCount = new LongAdder();
     private final LongAdder slowCount = new LongAdder();
     private final LongAdder criticalCount = new LongAdder();
+    private final LongAdder rejectedCount = new LongAdder();
 
     private final Cache<String, ?> timerCache;
     private final Cache<String, ?> counterCache;
     private final Cache<String, ?> sampleCache;
     private final int maxCacheSize;
 
-    private final ScheduledExecutorService statScheduler;
-    private final ScheduledExecutorService cacheMonitorScheduler;
+    private final ScheduledExecutorService scheduler;
 
     public SqlMonitorScheduler(Cache<String, ?> timerCache, Cache<String, ?> counterCache,
                                Cache<String, ?> sampleCache, int maxCacheSize) {
@@ -37,15 +37,9 @@ public class SqlMonitorScheduler {
         this.sampleCache = sampleCache;
         this.maxCacheSize = maxCacheSize;
 
-        // 初始化调度器
-        this.statScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "sql-stat-scheduler");
-            t.setDaemon(true);
-            return t;
-        });
-
-        this.cacheMonitorScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "sql-cache-monitor");
+        // 单线程调度器即可处理统计报告和缓存监控
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "sql-monitor-scheduler");
             t.setDaemon(true);
             return t;
         });
@@ -63,8 +57,18 @@ public class SqlMonitorScheduler {
      * 关闭调度器
      */
     public void stop() {
-        shutdownScheduler(statScheduler, "stat-scheduler");
-        shutdownScheduler(cacheMonitorScheduler, "cache-monitor");
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(3, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                scheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            log.debug("sql-monitor-scheduler 已关闭");
+        }
     }
 
     /**
@@ -89,19 +93,32 @@ public class SqlMonitorScheduler {
     }
 
     /**
+     * 增加被丢弃的任务计数（线程池满时触发）
+     */
+    public void incrementRejectedCount() {
+        rejectedCount.increment();
+    }
+
+    /**
      * 启动统计报告
      */
     private void startStatReport() {
-        statScheduler.scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(() -> {
             try {
                 long total = totalCount.sumThenReset();
                 long slow = slowCount.sumThenReset();
                 long critical = criticalCount.sumThenReset();
+                long rejected = rejectedCount.sumThenReset();
 
                 if (total > 0) {
-                    log.info("SQL监控统计 - 总执行: {}, 慢SQL: {} ({:.2f}%), 严重慢SQL: {} ({:.2f}%)",
-                            total, slow, (slow * 100.0 / total),
-                            critical, (critical * 100.0 / total));
+                    log.info("SQL监控统计 - 总执行: {}, 慢SQL: {} ({}%), 严重慢SQL: {} ({}%), 丢弃: {}",
+                            total,
+                            slow, String.format("%.2f", slow * 100.0 / total),
+                            critical, String.format("%.2f", critical * 100.0 / total),
+                            rejected);
+                }
+                if (rejected > 0) {
+                    log.warn("SQL监控任务被丢弃 {} 次（线程池队列已满），建议增大 pool.queue-capacity 或 pool.max-size", rejected);
                 }
             } catch (Exception e) {
                 log.error("统计报告执行失败", e);
@@ -113,7 +130,7 @@ public class SqlMonitorScheduler {
      * 启动缓存监控
      */
     private void startCacheMonitor() {
-        cacheMonitorScheduler.scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(() -> {
             try {
                 if (log.isDebugEnabled()) {
                     log.debug("Timer缓存统计: size={}",
@@ -136,23 +153,5 @@ public class SqlMonitorScheduler {
                 log.error("缓存监控执行失败", e);
             }
         }, 1, 1, TimeUnit.HOURS);
-    }
-
-    /**
-     * 关闭调度器
-     */
-    private void shutdownScheduler(ScheduledExecutorService scheduler, String name) {
-        if (scheduler != null && !scheduler.isShutdown()) {
-            scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(3, TimeUnit.SECONDS)) {
-                    scheduler.shutdownNow();
-                }
-            } catch (InterruptedException e) {
-                scheduler.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
-            log.debug("{} 已关闭", name);
-        }
     }
 }

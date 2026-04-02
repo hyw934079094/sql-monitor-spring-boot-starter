@@ -5,8 +5,8 @@ import lombok.Data;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.EnvironmentAware;
 import org.springframework.core.env.Environment;
-import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -18,9 +18,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * @version 3.0.0
  */
 @Data
-@Component
 @ConfigurationProperties(prefix = "hyw.sql.monitor")
-public class SlowSqlProperties {
+public class SlowSqlProperties implements EnvironmentAware {
 
     private static final Logger log = LoggerFactory.getLogger(SlowSqlProperties.class);
 
@@ -45,14 +44,14 @@ public class SlowSqlProperties {
         private boolean enabled = true;
         private String maskChar = "*";
         private int maskLength = 4;
-        private List<String> sensitiveFields = Arrays.asList(
+        private List<String> sensitiveFields = new ArrayList<>(Arrays.asList(
                 "password", "pwd", "secret", "token",
                 "id_card", "idcard", "phone", "mobile",
                 "email", "bank_card", "credit_card"
-        );
-        private List<String> sensitiveTables = Arrays.asList(
+        ));
+        private List<String> sensitiveTables = new ArrayList<>(Arrays.asList(
                 "user", "account", "payment", "customer"
-        );
+        ));
     }
 
     @Data
@@ -68,9 +67,9 @@ public class SlowSqlProperties {
         private boolean enabled = true;
         private double monitorRate = 0.01;
         private double alertThreshold = 99.5;
-        private List<String> mdcKeys = Arrays.asList(
+        private List<String> mdcKeys = new ArrayList<>(Arrays.asList(
                 "traceId", "spanId", "userId", "requestId", "clientIp"
-        );
+        ));
     }
 
     @PostConstruct
@@ -78,6 +77,7 @@ public class SlowSqlProperties {
         validateConfigs();
     }
 
+    @Override
     public void setEnvironment(Environment environment) {
         this.environment = environment;
     }
@@ -107,8 +107,10 @@ public class SlowSqlProperties {
     private void validateConfigs() {
         if (slowThreshold <= 0) slowThreshold = 1000;
         if (criticalThreshold < slowThreshold) criticalThreshold = slowThreshold * 2;
-        if (sampleRate < 0 || sampleRate > 1) sampleRate = Math.max(0, Math.min(1, sampleRate));
+        sampleRate = Math.max(0, Math.min(1, sampleRate));
+        if (maxSqlLength < 100) maxSqlLength = 100;
         if (maxCacheSize < 100) maxCacheSize = 100;
+        if (dbTypeCacheSeconds < 1) dbTypeCacheSeconds = 1;
 
         PoolConfig poolConfig = this.pool;
         if (poolConfig.getCoreSize() < 1) poolConfig.setCoreSize(1);
@@ -125,8 +127,8 @@ public class SlowSqlProperties {
         if (props.containsKey("enabled")) {
             this.enabled = Boolean.parseBoolean(props.getProperty("enabled"));
         }
-        if (props.containsKey("slowSqlThreshold")) {
-            this.slowThreshold = parseLong(props.getProperty("slowSqlThreshold"), 1000L);
+        if (props.containsKey("slowThreshold")) {
+            this.slowThreshold = parseLong(props.getProperty("slowThreshold"), 1000L);
         }
         if (props.containsKey("criticalThreshold")) {
             this.criticalThreshold = parseLong(props.getProperty("criticalThreshold"), 5000L);
@@ -150,10 +152,11 @@ public class SlowSqlProperties {
     }
 
     private void notifyListeners(SlowSqlConfigSnapshot oldConfig) {
-        if (oldConfig.equals(snapshot())) return;
+        SlowSqlConfigSnapshot newConfig = snapshot();
+        if (oldConfig.equals(newConfig)) return;
         for (ConfigChangeListener listener : listeners) {
             try {
-                listener.onConfigChange(oldConfig, snapshot());
+                listener.onConfigChange(oldConfig, newConfig);
             } catch (Exception e) {
                 log.error("通知配置变更失败", e);
             }
@@ -165,6 +168,7 @@ public class SlowSqlProperties {
                 logEnabled, sampleRate, maxSqlLength, maxCacheSize);
     }
 
+    // 使用全限定名避免与 org.springframework.beans.factory.annotation.Value 冲突
     @lombok.Value
     public static class SlowSqlConfigSnapshot {
         boolean enabled;

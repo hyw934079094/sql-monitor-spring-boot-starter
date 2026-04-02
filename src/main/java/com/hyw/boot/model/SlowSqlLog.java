@@ -1,7 +1,9 @@
 package com.hyw.boot.model;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.util.List;
 
@@ -13,6 +15,8 @@ import java.util.List;
  */
 @Data
 @Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class SlowSqlLog {
     private long timestamp;
     private String threadName;
@@ -30,4 +34,5 @@ public class SlowSqlLog {
     private String errorMessage;
     private String traceId;
     private String userId;
+    private String dbType;
 }
