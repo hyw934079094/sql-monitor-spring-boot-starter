@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: sql-monitor-demo
+
+# 慢SQL监控组件配置
+hyw:
+  sql:
+    monitor:
+      enabled: true
+      slow-threshold: 800
+      critical-threshold: 3000
+      log-enabled: true
+      sample-rate: 0.05
+      max-sql-length: 3000
+      max-cache-size: 2000
+      db-type-cache-seconds: 60
+
+      # 脱敏配置
+      sensitive:
+        enabled: true
+        mask-char: "*"
+        mask-length: 4
+        sensitive-fields:
+          - password
+          - pwd
+          - secret
+          - token
+          - id_card
+          - phone
+          - mobile
+          - email
+          - bank_card
+        sensitive-tables:
+          - user
+          - account
+          - payment
+          - customer
+
+      # 线程池配置
+      pool:
+        core-size: 4
+        max-size: 8
+        queue-capacity: 2000
+        keep-alive-seconds: 60
+
+      # MDC链路追踪
+      mdc:
+        enabled: true
+        monitor-rate: 0.01
+        alert-threshold: 99.5
+        mdc-keys:
+          - traceId
+          - spanId
+          - userId
+          - requestId
+          - clientIp
+          - serverIp
+
+# 日志配置
+logging:
+  level:
+    com.hyw.boot: INFO
+    com.hyw.boot.monitor: INFO
+    com.baomidou.mybatisplus: INFO
+    com.hyw.mapper: INFO  # 生产可改为 WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{traceId}] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{traceId}] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/sql-monitor.log
+    max-size: 100MB
+    max-history: 30
