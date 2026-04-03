@@ -165,34 +165,47 @@ public class SqlMetricsHandler {
     private void recordMetrics(SqlInfo sqlInfo, long cost) {
         if (meterRegistry == null) return;
 
+        SlowSqlProperties.MetricsConfig metricsConfig = properties.getMetrics();
+        if (!metricsConfig.isEnabled()) return;
+
         String dbType = resolveDbType(sqlInfo.getDbType());
         String tablesTag = truncateTablesTag(sqlInfo.getTables());
+        String sqlType = sqlInfo.getSqlType() != null ? sqlInfo.getSqlType() : "unknown";
+        String resolvedSqlId = sqlInfo.getSqlId() != null ? sqlInfo.getSqlId() : "unknown";
+        boolean includeSqlId = metricsConfig.isIncludeSqlId();
 
-        // 缓存 key：sqlId + tables + dbType，三者确定唯一的指标维度组合
-        String timerKey = sqlInfo.getSqlId() + "_" + tablesTag + "_" + dbType;
-        Timer timer = timerCache.get(timerKey, k ->
-                Timer.builder("sql.execution.time")
-                        .tags(
-                                "sqlId", sqlInfo.getSqlId(),
-                                "sqlType", sqlInfo.getSqlType() != null ? sqlInfo.getSqlType() : "unknown",
-                                "tables", tablesTag,
-                                "dbType", dbType
-                        )
-                        .publishPercentiles(0.5, 0.95, 0.99)
-                        .register(meterRegistry)
-        );
+        // 缓存 key：根据配置决定是否包含 sqlId，降低时间序列基数
+        String timerKey = includeSqlId
+                ? resolvedSqlId + "_" + tablesTag + "_" + dbType
+                : sqlType + "_" + tablesTag + "_" + dbType;
+
+        Timer timer = timerCache.get(timerKey, k -> {
+            Timer.Builder builder = Timer.builder("sql.execution.time")
+                    .tags("sqlType", sqlType, "tables", tablesTag, "dbType", dbType);
+            if (includeSqlId) {
+                builder.tag("sqlId", resolvedSqlId);
+            }
+            if (metricsConfig.isPercentileHistogram()) {
+                builder.publishPercentileHistogram();
+            } else {
+                builder.publishPercentiles(metricsConfig.getClientPercentiles());
+            }
+            return builder.register(meterRegistry);
+        });
         timer.record(Duration.ofMillis(cost));
 
         if (cost > properties.getSlowThreshold()) {
-            String slowKey = "slow_" + sqlInfo.getSqlId() + "_" + dbType;
-            Counter slowCounter = counterCache.get(slowKey, k ->
-                    Counter.builder("sql.slow.count")
-                            .tags(
-                                    "sqlId", sqlInfo.getSqlId(),
-                                    "dbType", dbType
-                            )
-                            .register(meterRegistry)
-            );
+            String slowKey = includeSqlId
+                    ? "slow_" + resolvedSqlId + "_" + dbType
+                    : "slow_" + sqlType + "_" + dbType;
+            Counter slowCounter = counterCache.get(slowKey, k -> {
+                Counter.Builder builder = Counter.builder("sql.slow.count")
+                        .tags("sqlType", sqlType, "dbType", dbType);
+                if (includeSqlId) {
+                    builder.tag("sqlId", resolvedSqlId);
+                }
+                return builder.register(meterRegistry);
+            });
             slowCounter.increment();
         }
     }

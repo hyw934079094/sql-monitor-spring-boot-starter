@@ -36,6 +36,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 慢SQL监控拦截器
@@ -82,10 +83,33 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
     private final MdcMonitor mdcMonitor;
     private final List<SlowSqlHandler> slowSqlHandlers;
 
-    // ====== 熔断器状态 ======
+    // ====== 熔断器状态（不可变值对象 + CAS，保证 状态/时间戳 原子切换）======
+    private final AtomicReference<CircuitBreakerState> circuitState =
+            new AtomicReference<>(CircuitBreakerState.CLOSED);
+    /** 连续失败计数器 */
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
-    private volatile boolean degradedMode = false;
-    private volatile long degradedSince = 0;
+
+    /**
+     * 熔断器状态值对象（不可变）。
+     *
+     * <p>将 open 标志和 degradedSince 时间戳封装在同一个对象中，
+     * 通过 {@link AtomicReference#compareAndSet} 一次性交换，
+     * 彻底消除 "先设标志再设时间戳" 导致的竞态窗口。</p>
+     */
+    private static final class CircuitBreakerState {
+        static final CircuitBreakerState CLOSED = new CircuitBreakerState(false, 0);
+        final boolean open;
+        final long degradedSince;
+
+        CircuitBreakerState(boolean open, long degradedSince) {
+            this.open = open;
+            this.degradedSince = degradedSince;
+        }
+
+        static CircuitBreakerState openNow() {
+            return new CircuitBreakerState(true, System.currentTimeMillis());
+        }
+    }
 
     // ====== Caffeine 缓存 ======
     /** Micrometer Timer 缓存，key = sqlId */
@@ -319,11 +343,14 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
         }
 
         // 熔断检查：降级模式下跳过SQL解析/脱敏/指标上报，仅保留计数
-        if (this.degradedMode) {
-            if (System.currentTimeMillis() - this.degradedSince > CIRCUIT_BREAKER_RECOVERY_MS) {
-                this.degradedMode = false;
-                this.consecutiveFailures.set(0);
-                log.info("熔断恢复，恢复完整SQL监控");
+        CircuitBreakerState currentState = this.circuitState.get();
+        if (currentState.open) {
+            if (System.currentTimeMillis() - currentState.degradedSince > CIRCUIT_BREAKER_RECOVERY_MS) {
+                // CAS 保证只有一个线程执行恢复逻辑（整个状态对象原子替换）
+                if (this.circuitState.compareAndSet(currentState, CircuitBreakerState.CLOSED)) {
+                    this.consecutiveFailures.set(0);
+                    log.info("熔断恢复，恢复完整SQL监控");
+                }
             } else {
                 return;
             }
@@ -332,7 +359,7 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
         try {
             boolean needDetail = cost > this.properties.getSlowThreshold()
                     || this.shouldSample(sqlId)
-                    || this.meterRegistry != null;
+                    || (this.meterRegistry != null && this.properties.getMetrics().isEnabled());
 
             SqlInfo sqlInfo = needDetail
                     ? this.sqlInfoExtractor.extractSqlInfo(invocation)
@@ -342,17 +369,20 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
                 this.sqlMetricsHandler.handleSqlMetrics(sqlInfo, sqlId, cost, error, methodName);
             }
 
-            // 成功处理，重置连续失败计数
-            this.consecutiveFailures.set(0);
+            // 成功处理，重置连续失败计数（仅在非零时重置，减少不必要的 CAS 操作）
+            if (this.consecutiveFailures.get() > 0) {
+                this.consecutiveFailures.set(0);
+            }
 
         } catch (Exception e) {
             int failures = this.consecutiveFailures.incrementAndGet();
-            if (failures >= CIRCUIT_BREAKER_THRESHOLD && !this.degradedMode) {
-                // 顺序关键：先设时间戳再设标志，防止其他线程看到 degradedMode=true 但 degradedSince=0 导致立即恢复
-                this.degradedSince = System.currentTimeMillis();
-                this.degradedMode = true;
-                log.error("SQL监控连续失败 {} 次，触发熔断降级（仅计时模式），将在 {}s 后尝试恢复",
-                        failures, CIRCUIT_BREAKER_RECOVERY_MS / 1000);
+            if (failures >= CIRCUIT_BREAKER_THRESHOLD) {
+                // CAS 原子交换：状态 + 时间戳一次性写入，无竞态窗口
+                CircuitBreakerState expected = this.circuitState.get();
+                if (!expected.open && this.circuitState.compareAndSet(expected, CircuitBreakerState.openNow())) {
+                    log.error("SQL监控连续失败 {} 次，触发熔断降级（仅计时模式），将在 {}s 后尝试恢复",
+                            failures, CIRCUIT_BREAKER_RECOVERY_MS / 1000);
+                }
             } else {
                 log.error("处理SQL指标失败 ({}/{}) - sqlId: {}, error: {}",
                         failures, CIRCUIT_BREAKER_THRESHOLD, sqlId, e.getMessage(), e);

@@ -59,14 +59,21 @@ public class DatabaseTypeDetector {
     private String doGetDatabaseType() {
         if (applicationContext != null) {
             try {
+                // 使用 getBeanProvider 替代 getBean：多数据源时自动选取 @Primary Bean，
+                // 无 @Primary 时返回 null（而非抛 NoUniqueBeanDefinitionException）
                 org.apache.ibatis.session.SqlSessionFactory sqlSessionFactory =
-                        applicationContext.getBean(org.apache.ibatis.session.SqlSessionFactory.class);
-                String dbType = sqlSessionFactory.getConfiguration().getDatabaseId();
-                if (dbType != null) return dbType;
+                        applicationContext.getBeanProvider(org.apache.ibatis.session.SqlSessionFactory.class)
+                                .getIfAvailable();
+                if (sqlSessionFactory != null) {
+                    String dbType = sqlSessionFactory.getConfiguration().getDatabaseId();
+                    if (dbType != null) return dbType;
+                }
             } catch (Exception ignored) {}
 
             try {
-                javax.sql.DataSource dataSource = applicationContext.getBean(javax.sql.DataSource.class);
+                javax.sql.DataSource dataSource = applicationContext
+                        .getBeanProvider(javax.sql.DataSource.class).getIfAvailable();
+                if (dataSource == null) throw new IllegalStateException("No DataSource available");
                 String jdbcUrl = getJdbcUrlFromDataSource(dataSource);
                 if (jdbcUrl != null) {
                     return inferDbTypeFromUrl(jdbcUrl);
@@ -132,8 +139,8 @@ public class DatabaseTypeDetector {
      * 数据库类型缓存
      */
     private static class DatabaseTypeCache {
-        String dbType;
-        long fetchTime;
+        final String dbType;
+        final long fetchTime;
 
         DatabaseTypeCache(String dbType, long fetchTime) {
             this.dbType = dbType;

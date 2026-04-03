@@ -103,6 +103,7 @@
             <groupId>com.baomidou</groupId>
             <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
             <version>${mybatis-plus.version}</version>
+            <scope>provided</scope>
             <exclusions>
                 <!-- 排除自带的 jsqlparser，避免版本冲突 -->
                 <exclusion>
@@ -148,11 +149,20 @@
         </dependency>
 
 
+        <!-- ========== Test ========== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- 监控 & 连接池 -->
+        <!-- micrometer-core 是必需依赖：Timer/Counter 类型在拦截器和指标处理器中被直接引用，
+             消费方未引入时会导致 NoClassDefFoundError。
+             企业项目通常已通过 spring-boot-starter-actuator 引入。 -->
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
-            <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>com.zaxxer</groupId>

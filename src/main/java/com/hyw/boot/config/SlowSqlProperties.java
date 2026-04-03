@@ -35,6 +35,7 @@ public class SlowSqlProperties implements EnvironmentAware {
     private SensitiveConfig sensitive = new SensitiveConfig();
     private PoolConfig pool = new PoolConfig();
     private MdcConfig mdc = new MdcConfig();
+    private MetricsConfig metrics = new MetricsConfig();
 
     private final List<ConfigChangeListener> listeners = new CopyOnWriteArrayList<>();
     private Environment environment;
@@ -70,6 +71,18 @@ public class SlowSqlProperties implements EnvironmentAware {
         private List<String> mdcKeys = new ArrayList<>(Arrays.asList(
                 "traceId", "spanId", "userId", "requestId", "clientIp"
         ));
+    }
+
+    @Data
+    public static class MetricsConfig {
+        /** 是否启用 Micrometer 指标上报 */
+        private boolean enabled = true;
+        /** 是否将 sqlId 作为 tag（高基数警告：大型项目中 sqlId 可能有数千个，开启后会导致时间序列爆炸） */
+        private boolean includeSqlId = false;
+        /** 是否使用服务端直方图（推荐，替代客户端百分位数，利于 Prometheus 聚合） */
+        private boolean percentileHistogram = true;
+        /** 客户端百分位数（仅在 percentileHistogram=false 时生效） */
+        private double[] clientPercentiles = {0.5, 0.95, 0.99};
     }
 
     @PostConstruct

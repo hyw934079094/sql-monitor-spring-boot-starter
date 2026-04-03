@@ -16,6 +16,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * SQL信息提取器（支持自动数据库类型适配）
@@ -27,6 +28,10 @@ public class SqlInfoExtractor {
 
     private static final Logger log = LoggerFactory.getLogger(SqlInfoExtractor.class);
     private static final Pattern WHITESPACE_PATTERN = Pattern.compile("\\s+");
+    /** MyBatis 自动生成的位置参数名（param1, param2, ...），在格式化时过滤 */
+    private static final Pattern MYBATIS_PARAM_PATTERN = Pattern.compile("param\\d+");
+    /** SQL 解析最大长度，超过此长度跳过 JSqlParser 解析，防止解析器挂起阻塞线程池 */
+    private static final int SQL_PARSE_MAX_LENGTH = 10_000;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
@@ -55,13 +60,6 @@ public class SqlInfoExtractor {
             MappedStatement mappedStatement = (MappedStatement) invocation.getArgs()[0];
             Object parameter = invocation.getArgs().length > 1 ? invocation.getArgs()[1] : null;
 
-            if ("batch".equals(invocation.getMethod().getName()) && parameter instanceof Collection) {
-                Collection<?> params = (Collection<?>) parameter;
-                if (!params.isEmpty()) {
-                    parameter = params.iterator().next();
-                }
-            }
-
             BoundSql boundSql = mappedStatement.getBoundSql(parameter);
             String sql = boundSql.getSql();
 
@@ -69,8 +67,16 @@ public class SqlInfoExtractor {
             String dbType = databaseTypeDetector.getDatabaseType();
             sql = adaptSqlByDbType(sql, dbType);
 
-            // 解析SQL
-            SqlParser.SqlParseResult parseResult = sqlParser.parse(sql);
+            // 解析SQL（超长 SQL 跳过解析，防止解析器挂起）
+            SqlParser.SqlParseResult parseResult;
+            if (sql.length() > SQL_PARSE_MAX_LENGTH) {
+                log.debug("SQL 长度 {} 超过解析上限 {}，跳过解析", sql.length(), SQL_PARSE_MAX_LENGTH);
+                parseResult = new SqlParser.SqlParseResult();
+                parseResult.setOriginalSql(sql);
+                parseResult.setSqlType(inferSqlTypeByPrefix(sql));
+            } else {
+                parseResult = sqlParser.parse(sql);
+            }
 
             // 脱敏
             String filteredSql = sensitiveFilter.filter(sql);
@@ -86,9 +92,9 @@ public class SqlInfoExtractor {
                     .sqlType(parseResult.getSqlType())
                     .tables(parseResult.getTables())
                     .whereCondition(parseResult.getWhereCondition())
-                    .params(formatParameter(parameter))
                     .hasJoin(parseResult.isHasJoin())
                     .hasSubQuery(parseResult.isHasSubQuery())
+                    .params(formatParameter(parameter, boundSql))
                     .dbType(dbType)
                     .traceId(MDC.get("traceId"))
                     .userId(MDC.get("userId"));
@@ -102,6 +108,21 @@ public class SqlInfoExtractor {
     }
 
     /**
+     * 通过 SQL 前缀关键字快速推断 SQL 类型（用于超长 SQL 跳过完整解析时的降级方案）
+     */
+    private String inferSqlTypeByPrefix(String sql) {
+        String trimmed = sql.stripLeading();
+        if (trimmed.length() < 6) return "UNKNOWN";
+        String prefix = trimmed.substring(0, 6).toUpperCase();
+        if (prefix.startsWith("SELECT")) return "SELECT";
+        if (prefix.startsWith("INSERT")) return "INSERT";
+        if (prefix.startsWith("UPDATE")) return "UPDATE";
+        if (prefix.startsWith("DELETE")) return "DELETE";
+        if (prefix.startsWith("MERGE")) return "MERGE";
+        return "UNKNOWN";
+    }
+
+    /**
      * 数据库类型自动适配SQL（用于监控展示，不影响实际执行）
      */
     private String adaptSqlByDbType(String sql, String dbType) {
@@ -112,12 +133,9 @@ public class SqlInfoExtractor {
             case "oracle" ->
                 // 移除Oracle双引号包裹（仅用于监控展示）
                     sql.replace("\"", "");
-            case "postgresql" ->
-                // PG适配（移除多余换行）
-                    sql.trim();
-            case "sqlserver" ->
-                // SQL Server适配
-                    sql.replace("[", "").replace("]", "");
+            case "dm" ->
+                // 达梦数据库类似Oracle处理
+                    sql.replace("\"", "");
             default -> sql;
         };
     }
@@ -125,76 +143,68 @@ public class SqlInfoExtractor {
     /**
      * 格式化参数
      */
-    private String formatParameter(Object parameter) {
-        if (parameter == null) return "null";
-
+    @SuppressWarnings("unchecked")
+    private String formatParameter(Object parameter, BoundSql boundSql) {
         try {
+            if (parameter == null) {
+                return "null";
+            }
+
             if (parameter instanceof Map) {
-                Map<?, ?> map = (Map<?, ?>) parameter;
-                if (map.size() > 50) {
-                    return String.format("Map(size=%d)", map.size());
-                }
-                Map<String, Object> filteredMap = new HashMap<>(map.size());
-                for (Map.Entry<?, ?> entry : map.entrySet()) {
-                    String key = String.valueOf(entry.getKey());
-                    // 过滤MyBatis自动生成的 param1, param2 等重复参数
-                    if (!key.startsWith("param")) {
-                        filteredMap.put(key, safeObjectToString(entry.getValue()));
-                    }
-                }
-                return OBJECT_MAPPER.writeValueAsString(filteredMap);
+                return formatMapParameter((Map<String, Object>) parameter);
             }
 
             if (parameter instanceof Collection) {
                 Collection<?> collection = (Collection<?>) parameter;
-                if (collection.isEmpty()) return "empty collection";
-                if (collection.size() > 10) {
-                    return String.format("Collection(size=%d, first: %s...)",
-                            collection.size(), safeObjectToString(collection.iterator().next()));
+                if (collection.size() > 50) {
+                    return "Collection(size=" + collection.size() + ")";
                 }
-                return OBJECT_MAPPER.writeValueAsString(collection);
+                return collection.stream()
+                        .map(this::safeObjectToString)
+                        .collect(Collectors.joining(", ", "[", "]"));
             }
 
-            if (parameter.getClass().isArray()) {
-                int length = java.lang.reflect.Array.getLength(parameter);
-                if (length == 0) return "empty array";
-                if (length > 10) {
-                    return String.format("Array(length=%d, first: %s...)",
-                            length, safeObjectToString(java.lang.reflect.Array.get(parameter, 0)));
-                }
-                return OBJECT_MAPPER.writeValueAsString(parameter);
-            }
-
-            return sensitiveFilter.filter(parameter.toString());
-
+            return safeObjectToString(parameter);
         } catch (Exception e) {
-            return String.format("参数格式化失败: %s", e.getMessage());
+            return "参数格式化失败: " + e.getMessage();
         }
     }
 
     /**
-     * 安全的对象转字符串
+     * 格式化Map参数（过滤mybatis内部参数）
+     */
+    private String formatMapParameter(Map<String, Object> map) {
+        if (map.size() > 50) {
+            return "Map(size=" + map.size() + ")";
+        }
+
+        Map<String, String> filtered = new HashMap<>();
+        map.forEach((key, value) -> {
+            // 过滤mybatis自动生成的参数名(param1, param2...)
+            if (key != null && !MYBATIS_PARAM_PATTERN.matcher(key).matches()) {
+                filtered.put(key, safeObjectToString(value));
+            }
+        });
+
+        try {
+            return OBJECT_MAPPER.writeValueAsString(filtered);
+        } catch (Exception e) {
+            return filtered.toString();
+        }
+    }
+
+    /**
+     * 安全的对象转字符串（防止超长）
      */
     private String safeObjectToString(Object obj) {
-        if (obj == null) return "null";
-        try {
-            if (obj instanceof String) {
-                String str = (String) obj;
-                if (str.length() > 200) {
-                    str = str.substring(0, 200) + "...";
-                }
-                return sensitiveFilter.filter(str);
-            }
-            if (obj instanceof Number || obj instanceof Boolean) {
-                return obj.toString();
-            }
-            String str = obj.toString();
-            if (str.length() > 100) {
-                str = str.substring(0, 100) + "...";
-            }
-            return sensitiveFilter.filter(str);
-        } catch (Exception e) {
-            return obj.getClass().getSimpleName() + "@" + Integer.toHexString(obj.hashCode());
+        if (obj == null) {
+            return "null";
         }
+        if (obj instanceof String) {
+            String str = (String) obj;
+            return str.length() > 200 ? str.substring(0, 200) + "..." : str;
+        }
+        String str = obj.toString();
+        return str.length() > 100 ? str.substring(0, 100) + "..." : str;
     }
 }

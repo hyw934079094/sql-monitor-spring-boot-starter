@@ -59,9 +59,9 @@ public class SlowSqlAutoConfiguration {
         return new JSqlParser();
     }
 
-    @Bean
-    @ConditionalOnMissingBean
-    public TaskDecorator mdcTaskDecorator(SlowSqlProperties properties) {
+    @Bean(name = "sqlMonitorMdcTaskDecorator")
+    @ConditionalOnMissingBean(name = "sqlMonitorMdcTaskDecorator")
+    public TaskDecorator sqlMonitorMdcTaskDecorator(SlowSqlProperties properties) {
         return new EnhancedMdcTaskDecorator(properties);
     }
 
@@ -82,7 +82,7 @@ public class SlowSqlAutoConfiguration {
     @ConditionalOnMissingBean(name = "sqlMonitorExecutor")
     public ThreadPoolTaskExecutor sqlMonitorExecutor(
             SlowSqlProperties properties,
-            TaskDecorator mdcTaskDecorator) {
+            @Qualifier("sqlMonitorMdcTaskDecorator") TaskDecorator mdcTaskDecorator) {
 
         SlowSqlProperties.PoolConfig poolConfig = properties.getPool();
 

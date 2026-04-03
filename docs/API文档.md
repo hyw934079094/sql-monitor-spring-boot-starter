@@ -376,13 +376,22 @@ mdc-monitor-scheduler 线程（每分钟执行一次）
 | `mdc.alert-threshold` | double | 99.5 | MDC 传递成功率告警阈值（%） |
 | `mdc.mdc-keys` | List | traceId, spanId, userId, requestId, clientIp | 需要跨线程传递和监控的 MDC key |
 
-### 7.5 最小配置（零配置启动）
+### 7.5 Metrics 配置（Micrometer）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `metrics.enabled` | boolean | true | 是否启用 Micrometer 指标上报（关闭后将跳过指标注册与上报，减少 SQL 解析触发场景） |
+| `metrics.include-sql-id` | boolean | false | 是否将 `sqlId` 作为 tag（高基数风险：大型项目可能导致时间序列爆炸，默认关闭） |
+| `metrics.percentile-histogram` | boolean | true | 是否使用直方图（推荐，利于 Prometheus 聚合） |
+| `metrics.client-percentiles` | double[] | 0.5, 0.95, 0.99 | 客户端百分位数（仅在 `percentile-histogram=false` 时生效） |
+
+### 7.6 最小配置（零配置启动）
 
 ```yaml
 # 无需任何配置，全部使用默认值即可工作
 ```
 
-### 7.6 生产推荐配置
+### 7.7 生产推荐配置
 
 ```yaml
 hyw:
@@ -392,6 +401,9 @@ hyw:
       critical-threshold: 3000
       sample-rate: 0.05
       log-enabled: true
+      metrics:
+        enabled: true
+        include-sql-id: false
       pool:
         core-size: 4
         max-size: 8
@@ -404,8 +416,8 @@ hyw:
 
 | 指标名 | 类型 | 标签 | 说明 |
 |--------|------|------|------|
-| `sql.execution.time` | Timer | sqlId, sqlType, tables, dbType | SQL 执行耗时分布（P50/P95/P99） |
-| `sql.slow.count` | Counter | sqlId, dbType | 慢 SQL 触发次数 |
+| `sql.execution.time` | Timer | sqlType, tables, dbType（可选 sqlId） | SQL 执行耗时分布（直方图/百分位） |
+| `sql.slow.count` | Counter | sqlType, dbType（可选 sqlId） | 慢 SQL 触发次数 |
 
 Grafana 查询示例：
 ```promql
@@ -478,9 +490,11 @@ public MdcMonitor mdcMonitor(SlowSqlProperties props) {
 
 ### 9.5 TaskDecorator — 自定义线程上下文传递
 
+如需覆盖本 Starter 的 MDC 传递装饰器，请提供同名 Bean：`sqlMonitorMdcTaskDecorator`。
+
 ```java
-@Bean
-public TaskDecorator mdcTaskDecorator(SlowSqlProperties props) {
+@Bean(name = "sqlMonitorMdcTaskDecorator")
+public TaskDecorator sqlMonitorMdcTaskDecorator(SlowSqlProperties props) {
     return new CustomTaskDecorator(props);
 }
 ```

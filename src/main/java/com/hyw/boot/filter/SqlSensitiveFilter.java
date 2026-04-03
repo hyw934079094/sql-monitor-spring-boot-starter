@@ -47,26 +47,30 @@ public class SqlSensitiveFilter {
         }
 
         // 敏感字段正则（支持单引号/双引号），统一使用 CASE_INSENSITIVE 标志
-        String fieldRegex = sensitive.getSensitiveFields()
-                .stream()
-                .map(Pattern::quote)
-                .collect(Collectors.joining("|"));
+        if (sensitive.getSensitiveFields() != null && !sensitive.getSensitiveFields().isEmpty()) {
+            String fieldRegex = sensitive.getSensitiveFields()
+                    .stream()
+                    .map(Pattern::quote)
+                    .collect(Collectors.joining("|"));
 
-        this.sensitiveFieldPattern = Pattern.compile(
-                "(" + fieldRegex + ")\\s*=\\s*(['\"])(.*?)\\2",
-                Pattern.CASE_INSENSITIVE
-        );
+            this.sensitiveFieldPattern = Pattern.compile(
+                    "(" + fieldRegex + ")\\s*=\\s*(['\"])(.*?)\\2",
+                    Pattern.CASE_INSENSITIVE
+            );
+        }
 
         // 敏感表正则
-        String tableRegex = sensitive.getSensitiveTables()
-                .stream()
-                .map(Pattern::quote)
-                .collect(Collectors.joining("|"));
+        if (sensitive.getSensitiveTables() != null && !sensitive.getSensitiveTables().isEmpty()) {
+            String tableRegex = sensitive.getSensitiveTables()
+                    .stream()
+                    .map(Pattern::quote)
+                    .collect(Collectors.joining("|"));
 
-        this.sensitiveTablePattern = Pattern.compile(
-                "\\b(from|into|update|join)\\s+(" + tableRegex + ")\\b",
-                Pattern.CASE_INSENSITIVE
-        );
+            this.sensitiveTablePattern = Pattern.compile(
+                    "\\b(from|into|update|join)\\s+(" + tableRegex + ")\\b",
+                    Pattern.CASE_INSENSITIVE
+            );
+        }
         log.debug("=== SQL脱敏过滤器初始化完成 ===");
     }
 
@@ -148,12 +152,13 @@ public class SqlSensitiveFilter {
      */
     private String maskSensitiveTableData(String sql) {
         String result = sql;
-        // INSERT VALUES 脱敏
-        result = result.replaceAll("(?i)values\\s*\\([^)]*\\)", "values(***)");
-        // SET 子句中的值脱敏
-        result = result.replaceAll("(?i)set\\s+(.+?)(?=\\s+where|$)", "SET ***");
-        // WHERE 条件中的字面值脱敏
-        result = result.replaceAll("=\\s*(['\"]).*?\\1", "='***'");
+        // INSERT VALUES 脱敏（覆盖多行 INSERT：VALUES (...), (...), ...）
+        // (?s) DOTALL 使 .* 匹配换行符，防止多行 SQL 仅脱敏首行
+        result = result.replaceAll("(?is)(values)\\s+.*", "$1 (***)");
+        // SET 子句中的值脱敏（\z 匹配字符串绝对末尾，避免 $ 在 MULTILINE 下歧义）
+        result = result.replaceAll("(?is)set\\s+(.+?)(?=\\s+where|\\z)", "SET ***");
+        // WHERE 条件中的字面值脱敏（DOTALL 使引号内的换行也被匹配）
+        result = result.replaceAll("(?s)=\\s*(['\"]).*?\\1", "='***'");
         return result;
     }
 
