@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS t_order (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100),
+    amount DECIMAL(10,2),
+    status VARCHAR(20)
+);
+
+CREATE TABLE IF NOT EXISTS t_user (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50),
+    password VARCHAR(100),
+    phone VARCHAR(20)
+);

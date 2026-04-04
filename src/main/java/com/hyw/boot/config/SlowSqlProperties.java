@@ -31,6 +31,7 @@ public class SlowSqlProperties implements EnvironmentAware {
     private int maxSqlLength = 2000;
     private int maxCacheSize = 1000;
     private int dbTypeCacheSeconds = 60;
+    private int sqlParseMaxLength = 10000;
 
     private SensitiveConfig sensitive = new SensitiveConfig();
     private PoolConfig pool = new PoolConfig();
@@ -76,7 +77,7 @@ public class SlowSqlProperties implements EnvironmentAware {
     @Data
     public static class MetricsConfig {
         /** 是否启用 Micrometer 指标上报 */
-        private boolean enabled = true;
+        private boolean enabled = false;
         /** 是否将 sqlId 作为 tag（高基数警告：大型项目中 sqlId 可能有数千个，开启后会导致时间序列爆炸） */
         private boolean includeSqlId = false;
         /** 是否使用服务端直方图（推荐，替代客户端百分位数，利于 Prometheus 聚合） */
@@ -124,6 +125,8 @@ public class SlowSqlProperties implements EnvironmentAware {
         if (maxSqlLength < 100) maxSqlLength = 100;
         if (maxCacheSize < 100) maxCacheSize = 100;
         if (dbTypeCacheSeconds < 1) dbTypeCacheSeconds = 1;
+        if (sqlParseMaxLength < 1000) sqlParseMaxLength = 1000;
+        if (sqlParseMaxLength > 100_000) sqlParseMaxLength = 100_000;
 
         PoolConfig poolConfig = this.pool;
         if (poolConfig.getCoreSize() < 1) poolConfig.setCoreSize(1);
@@ -178,7 +181,7 @@ public class SlowSqlProperties implements EnvironmentAware {
 
     private SlowSqlConfigSnapshot snapshot() {
         return new SlowSqlConfigSnapshot(enabled, slowThreshold, criticalThreshold,
-                logEnabled, sampleRate, maxSqlLength, maxCacheSize);
+                logEnabled, sampleRate, maxSqlLength, maxCacheSize, sqlParseMaxLength);
     }
 
     // 使用全限定名避免与 org.springframework.beans.factory.annotation.Value 冲突
@@ -191,6 +194,7 @@ public class SlowSqlProperties implements EnvironmentAware {
         double sampleRate;
         int maxSqlLength;
         int maxCacheSize;
+        int sqlParseMaxLength;
     }
 
     private long parseLong(String value, long defaultValue) {

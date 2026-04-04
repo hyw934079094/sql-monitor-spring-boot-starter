@@ -6,7 +6,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
 
+import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -23,21 +25,34 @@ public class SqlSensitiveFilter {
 
     private final SlowSqlProperties properties;
 
+    /** 脱敏正则处理的最大 SQL 长度，超过此长度跳过正则脱敏防止 ReDoS */
+    private static final int DESENSITIZE_MAX_LENGTH = 20_000;
+
     // 正则
-    private Pattern sensitiveFieldPattern;
-    private Pattern sensitiveTablePattern;
+    private volatile Pattern sensitiveFieldPattern;
+    private volatile Pattern sensitiveTablePattern;
     private final Pattern phonePattern = Pattern.compile("(1[3-9]\\d{9})");
     private final Pattern idCardPattern = Pattern.compile("[1-9]\\d{5}(19|20)\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])\\d{3}[\\dXx]");
+    /** 敏感字段名集合（小写），用于参数级脱敏判断 */
+    private volatile Set<String> sensitiveFieldNames = Set.of();
 
     public SqlSensitiveFilter(SlowSqlProperties properties) {
         this.properties = properties;
+        // 在构造器中完成初始化，保证无论是否由 Spring 管理都能正确工作
+        doInitPattern();
     }
 
     /**
-     * 初始化正则（启动时执行一次）
+     * 初始化正则（保留为 public 方法以兼容显式调用，内部已在构造器中自动执行）。
+     *
+     * <p>幂等：多次调用不会产生副作用。</p>
      */
     @PostConstruct
     public void initPattern() {
+        doInitPattern();
+    }
+
+    private void doInitPattern() {
         log.debug("=== SQL脱敏过滤器初始化开始 ===");
 
         SlowSqlProperties.SensitiveConfig sensitive = properties.getSensitive();
@@ -46,13 +61,18 @@ public class SqlSensitiveFilter {
             return;
         }
 
-        // 敏感字段正则（支持单引号/双引号），统一使用 CASE_INSENSITIVE 标志
-        if (sensitive.getSensitiveFields() != null && !sensitive.getSensitiveFields().isEmpty()) {
-            String fieldRegex = sensitive.getSensitiveFields()
-                    .stream()
+        // 构建敏感字段名集合（小写），用于参数级脱敏
+        List<String> fields = sensitive.getSensitiveFields();
+        if (fields != null && !fields.isEmpty()) {
+            this.sensitiveFieldNames = fields.stream()
+                    .map(String::toLowerCase)
+                    .collect(Collectors.toUnmodifiableSet());
+
+            String fieldRegex = fields.stream()
                     .map(Pattern::quote)
                     .collect(Collectors.joining("|"));
 
+            // 匹配引号包裹的值：field = 'xxx' 或 field = "xxx"
             this.sensitiveFieldPattern = Pattern.compile(
                     "(" + fieldRegex + ")\\s*=\\s*(['\"])(.*?)\\2",
                     Pattern.CASE_INSENSITIVE
@@ -83,8 +103,14 @@ public class SqlSensitiveFilter {
             return sql;
         }
 
+        // ReDoS 防护：超长 SQL 跳过正则脱敏，直接截断返回
+        if (sql.length() > DESENSITIZE_MAX_LENGTH) {
+            log.debug("SQL 长度 {} 超过脱敏上限 {}，跳过正则脱敏", sql.length(), DESENSITIZE_MAX_LENGTH);
+            return sql.substring(0, DESENSITIZE_MAX_LENGTH) + "...[truncated]";
+        }
+
         try {
-            log.debug("开始脱敏SQL：{}", sql);
+            log.debug("开始脱敏SQL（长度={}）", sql.length());
 
             boolean isSensitiveTable = isSensitiveTable(sql);
             String filtered;
@@ -154,8 +180,9 @@ public class SqlSensitiveFilter {
         String result = sql;
         // INSERT VALUES 脱敏（覆盖多行 INSERT：VALUES (...), (...), ...）
         // (?s) DOTALL 使 .* 匹配换行符，防止多行 SQL 仅脱敏首行
+        // 注：ReDoS 已由 DESENSITIZE_MAX_LENGTH 前置守卫防护
         result = result.replaceAll("(?is)(values)\\s+.*", "$1 (***)");
-        // SET 子句中的值脱敏（\z 匹配字符串绝对末尾，避免 $ 在 MULTILINE 下歧义）
+        // SET 子句中的值脱敏（用字面量 "SET ***" 替换，归一化空白）
         result = result.replaceAll("(?is)set\\s+(.+?)(?=\\s+where|\\z)", "SET ***");
         // WHERE 条件中的字面值脱敏（DOTALL 使引号内的换行也被匹配）
         result = result.replaceAll("(?s)=\\s*(['\"]).*?\\1", "='***'");
@@ -190,6 +217,19 @@ public class SqlSensitiveFilter {
         }
         matcher.appendTail(sb);
         return sb.toString();
+    }
+
+    /**
+     * 判断给定字段名是否为敏感字段（用于参数级脱敏）。
+     *
+     * @param fieldName 字段名（大小写不敏感）
+     * @return true 如果是配置中的敏感字段
+     */
+    public boolean isSensitiveField(String fieldName) {
+        if (fieldName == null || sensitiveFieldNames.isEmpty()) {
+            return false;
+        }
+        return sensitiveFieldNames.contains(fieldName.toLowerCase());
     }
 
     /**

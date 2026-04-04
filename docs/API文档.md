@@ -8,7 +8,7 @@
 
 - 异步慢 SQL 检测与告警（不阻塞业务线程）
 - SQL 敏感信息自动脱敏
-- Micrometer 指标上报（Prometheus / Grafana 就绪）
+- Micrometer 指标上报（可选；默认关闭，需要显式启用，提供 Grafana 面板 JSON 文件）
 - MDC 链路上下文跨线程传递与健康监控
 - 熔断降级保护（监控组件异常不影响业务）
 - SlowSqlHandler SPI 扩展点（自定义持久化）
@@ -380,7 +380,7 @@ mdc-monitor-scheduler 线程（每分钟执行一次）
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `metrics.enabled` | boolean | true | 是否启用 Micrometer 指标上报（关闭后将跳过指标注册与上报，减少 SQL 解析触发场景） |
+| `metrics.enabled` | boolean | false | 是否启用 Micrometer 指标上报（默认关闭；关闭后将跳过指标注册与上报） |
 | `metrics.include-sql-id` | boolean | false | 是否将 `sqlId` 作为 tag（高基数风险：大型项目可能导致时间序列爆炸，默认关闭） |
 | `metrics.percentile-histogram` | boolean | true | 是否使用直方图（推荐，利于 Prometheus 聚合） |
 | `metrics.client-percentiles` | double[] | 0.5, 0.95, 0.99 | 客户端百分位数（仅在 `percentile-histogram=false` 时生效） |
@@ -412,7 +412,18 @@ hyw:
 
 ---
 
-## 八、Micrometer 指标
+## 八、Micrometer 指标（可选）
+
+> 默认行为：本 Starter **默认关闭指标上报**（`hyw.sql.monitor.metrics.enabled=false`）。
+> 如需指标采集/上报（例如 Prometheus/Grafana），请在业务配置中显式开启：
+>
+> ```yaml
+> hyw:
+>   sql:
+>     monitor:
+>       metrics:
+>         enabled: true
+> ```
 
 | 指标名 | 类型 | 标签 | 说明 |
 |--------|------|------|------|
@@ -538,7 +549,25 @@ management:
 
 访问 `/actuator/prometheus`，搜索 `sql_execution_time` 和 `sql_slow_count`。
 
+Grafana Dashboard 模板文件：
+
+- `grafana/sql-monitor-dashboard.json`
+
 ---
+
+## 九、Actuator 健康检查（可选）
+
+业务方引入 `spring-boot-starter-actuator` 后，本 Starter 将自动注册 `SqlMonitorHealthIndicator`。
+
+可通过以下端点查看 SQL Monitor 的健康状态：
+
+- `/actuator/health`
+
+健康信息中会包含：
+
+- 熔断器状态（OPEN/CLOSED）
+- 连续失败次数（`consecutiveFailures`）
+- 异步线程池状态（activeCount / poolSize / queueSize 等）
 
 ## 十一、日志输出参考
 

@@ -185,14 +185,14 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
         // 1. 先初始化 databaseTypeDetector
         this.databaseTypeDetector = new DatabaseTypeDetector(
                 this.applicationContext,
-                this.properties.getDbTypeCacheSeconds()
+                this.properties
         );
 
         // 2. 再初始化依赖 databaseTypeDetector 的 sqlInfoExtractor
         this.sqlInfoExtractor = new SqlInfoExtractor(
                 this.sensitiveFilter,
                 this.sqlParser,
-                this.properties.getMaxSqlLength(),
+                this.properties,
                 this.databaseTypeDetector
         );
 
@@ -270,6 +270,25 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
     @Override
     public void setProperties(Properties properties) {
         this.properties.mergeProperties(properties);
+    }
+
+    // ====================================================================
+    // 健康检查暴露接口
+    // ====================================================================
+
+    /** 熔断器是否处于打开（降级）状态 */
+    public boolean isCircuitBreakerOpen() {
+        return this.circuitState.get().open;
+    }
+
+    /** 当前连续失败次数 */
+    public int getConsecutiveFailures() {
+        return this.consecutiveFailures.get();
+    }
+
+    /** 获取异步线程池引用（用于健康检查读取线程池状态） */
+    public ThreadPoolTaskExecutor getAsyncExecutor() {
+        return this.asyncExecutor;
     }
 
     // ====================================================================
@@ -369,10 +388,8 @@ public class UniversalSlowSqlInterceptor implements Interceptor, SlowSqlProperti
                 this.sqlMetricsHandler.handleSqlMetrics(sqlInfo, sqlId, cost, error, methodName);
             }
 
-            // 成功处理，重置连续失败计数（仅在非零时重置，减少不必要的 CAS 操作）
-            if (this.consecutiveFailures.get() > 0) {
-                this.consecutiveFailures.set(0);
-            }
+            // 成功处理，无条件重置连续失败计数，避免 check-then-act 竞态
+            this.consecutiveFailures.set(0);
 
         } catch (Exception e) {
             int failures = this.consecutiveFailures.incrementAndGet();

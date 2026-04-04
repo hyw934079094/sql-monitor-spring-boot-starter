@@ -52,6 +52,12 @@ public class SqlMetricsHandler {
     // ====== 依赖 ======
     private final SlowSqlProperties properties;
     private final MeterRegistry meterRegistry;   // 可为 null
+    /**
+     * Timer/Counter 缓存仅作为性能优化，避免每次查询 MeterRegistry 的开销。
+     * Caffeine 驱逐条目后，下次 get() 会重新调用 Timer.builder().register()，
+     * Micrometer 的 register() 方法是幂等的——同名同 tag 会返回已存在的 Meter，
+     * 不会产生重复指标或计数器重置。
+     */
     private final Cache<String, Timer> timerCache;
     private final Cache<String, Counter> counterCache;
     private final List<SlowSqlHandler> slowSqlHandlers;

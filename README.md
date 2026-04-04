@@ -15,7 +15,7 @@
 | **慢 SQL 检测** | 异步计时 + 分级告警（WARN / ERROR），业务线程零阻塞 |
 | **确定性采样** | 基于 Murmur3 Hash，同一 SQL 采样结果恒定，不会时记时不记 |
 | **SQL 脱敏** | 敏感字段、敏感表、手机号、身份证自动脱敏，正则预编译 |
-| **Micrometer 指标** | Timer + Counter，Prometheus / Grafana 就绪，默认防高基数 |
+| **Micrometer 指标** | Timer + Counter，Prometheus / Grafana 就绪（默认关闭，按需开启；默认防高基数） |
 | **MDC 链路追踪** | 跨线程传递 traceId 等上下文，附带传递成功率监控 |
 | **熔断降级** | 监控组件连续异常时自动降级（仅计数），60s 后自动恢复 |
 | **SPI 扩展** | 实现 `SlowSqlHandler` 接口即可将慢 SQL 持久化到 DB/ES/MQ |
@@ -51,11 +51,17 @@
 
 ### Step 2：启动应用
 
-**无需任何配置**，默认即可工作：
+**无需任何配置**，默认即可工作（开箱即用的“最小化能力”）：
+
+- 仅基于耗时判断慢 SQL（默认阈值 1000ms / 5000ms）
+- 发现慢 SQL 时输出 `WARN/ERROR` 日志，便于你直接通过日志定位并优化 SQL
+
+默认值：
+
 - 慢 SQL 阈值 1000ms
 - 严重慢 SQL 阈值 5000ms
-- 采样率 1%
-- 线程池 core=2, max=4, queue=1000
+- 线程池 core=2, max=4, queue=1000（监控任务异步执行，不阻塞业务线程）
+- `metrics.enabled=false`（默认不采集/不上报指标）
 
 ```
 INFO  慢SQL监控初始化完成 - 线程池: core=2, max=4, queue=1000, MDC监控=true
@@ -71,6 +77,28 @@ INFO  SQL监控统计 - 总执行: 1286, 慢SQL: 23 (1.79%), 严重慢SQL: 2 (0.
 
 ---
 
+## 可选增强能力（按需开启）
+
+你可以从“仅日志发现慢 SQL”逐步升级到更完整的可观测体系：
+
+- **Micrometer 指标采集/上报**
+  - 开关：`hyw.sql.monitor.metrics.enabled=true`
+  - 说明：默认关闭；仅在你确实需要指标（如 Prometheus/Grafana）时开启
+
+- **Prometheus + Grafana 观测**
+  - 前提：开启 `metrics.enabled=true` + 接入 Prometheus Registry/抓取链路
+  - 看板：`grafana/sql-monitor-dashboard.json`
+
+- **Actuator 健康检查**
+  - 前提：业务方引入 `spring-boot-starter-actuator`
+  - 端点：`/actuator/health`
+
+- **MDC 传递监控（可选）**
+  - 开关：`hyw.sql.monitor.mdc.enabled=false` 可关闭
+  - 说明：如果你暂时不关注 MDC 传递成功率，可关闭以减少额外监控开销
+
+---
+
 ## 生产推荐配置
 
 ```yaml
@@ -83,7 +111,7 @@ hyw:
       log-enabled: true
 
       metrics:
-        enabled: true
+        enabled: true            # 默认关闭，生产环境按需开启
         include-sql-id: false      # ⚠️ 保持 false，防止 Prometheus 时间序列爆炸
         percentile-histogram: true  # 推荐，利于服务端聚合
 
@@ -119,6 +147,17 @@ hyw:
 
 ## Prometheus + Grafana 接入
 
+> 本 Starter **默认不启用 Micrometer 指标上报**（`hyw.sql.monitor.metrics.enabled=false`）。
+> 如需接入 Prometheus/Grafana，请先在配置中显式开启：
+
+```yaml
+hyw:
+  sql:
+    monitor:
+      metrics:
+        enabled: true
+```
+
 ```yaml
 # application.yml
 management:
@@ -127,6 +166,14 @@ management:
       exposure:
         include: prometheus
 ```
+
+### Grafana 仪表盘
+
+仓库已提供可直接导入的 Grafana Dashboard：
+
+- **路径**：`grafana/sql-monitor-dashboard.json`
+
+导入方式：Grafana -> Dashboards -> New -> Import -> 上传该 JSON 文件。
 
 ```promql
 # P99 SQL 执行时间
@@ -283,7 +330,7 @@ hyw:
 | `max-cache-size` | int | `1000` | Caffeine 缓存上限 |
 | `db-type-cache-seconds` | int | `60` | 数据库类型缓存时间（秒） |
 | **metrics.** | | | |
-| `metrics.enabled` | boolean | `true` | Micrometer 指标开关 |
+| `metrics.enabled` | boolean | `false` | Micrometer 指标开关（默认关闭，按需开启） |
 | `metrics.include-sql-id` | boolean | `false` | sqlId 作为 tag（⚠️ 高基数风险） |
 | `metrics.percentile-histogram` | boolean | `true` | 使用直方图（推荐） |
 | `metrics.client-percentiles` | double[] | `0.5,0.95,0.99` | 客户端百分位数 |
@@ -310,6 +357,13 @@ hyw:
 
 - [API 文档](docs/API文档.md) — 架构总览、类职责、SQL 生命周期、线程模型
 - [部署文档](docs/部署文档.md) — 环境要求、容器化、Kubernetes、Prometheus 告警规则
+
+---
+
+## Actuator 健康检查（可选）
+
+如业务方引入 `spring-boot-starter-actuator`，本 Starter 会自动注册 `SqlMonitorHealthIndicator`，
+在 `/actuator/health` 中暴露 SQL Monitor 健康状态（熔断状态、连续失败次数、线程池状态等）。
 
 ## License
 

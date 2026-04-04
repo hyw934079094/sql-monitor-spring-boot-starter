@@ -97,7 +97,7 @@ public class SlowSqlAutoConfiguration {
         executor.setTaskDecorator(mdcTaskDecorator);
         // AbortPolicy: 队列满时抛出 TaskRejectedException，由拦截器捕获并丢弃，避免阻塞业务线程
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        executor.setAllowCoreThreadTimeOut(true);
+        // 监控场景下保留核心线程，避免频繁创建/销毁线程的开销
 
         log.debug("初始化SQL监控线程池 - core={}, max={}, queue={}, MDC keys={}",
                 poolConfig.getCoreSize(), poolConfig.getMaxSize(),
@@ -129,5 +129,14 @@ public class SlowSqlAutoConfiguration {
                 mdcMonitor.getIfAvailable(),
                 slowSqlHandlers.orderedStream().toList()
         );
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
+    public SqlMonitorHealthIndicator sqlMonitorHealthIndicator(
+            SlowSqlProperties properties,
+            UniversalSlowSqlInterceptor interceptor) {
+        return new SqlMonitorHealthIndicator(properties, interceptor);
     }
 }

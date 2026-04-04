@@ -2,6 +2,7 @@ package com.hyw.boot.interceptor.handler;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.hyw.boot.config.SlowSqlProperties;
 import com.hyw.boot.filter.SqlSensitiveFilter;
 import com.hyw.boot.model.SqlInfo;
 import com.hyw.boot.parser.SqlParser;
@@ -30,23 +31,21 @@ public class SqlInfoExtractor {
     private static final Pattern WHITESPACE_PATTERN = Pattern.compile("\\s+");
     /** MyBatis 自动生成的位置参数名（param1, param2, ...），在格式化时过滤 */
     private static final Pattern MYBATIS_PARAM_PATTERN = Pattern.compile("param\\d+");
-    /** SQL 解析最大长度，超过此长度跳过 JSqlParser 解析，防止解析器挂起阻塞线程池 */
-    private static final int SQL_PARSE_MAX_LENGTH = 10_000;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
     private final SqlSensitiveFilter sensitiveFilter;
     private final SqlParser sqlParser;
-    private final int maxSqlLength;
+    private final SlowSqlProperties properties;
     private final DatabaseTypeDetector databaseTypeDetector;
 
     public SqlInfoExtractor(SqlSensitiveFilter sensitiveFilter,
                             SqlParser sqlParser,
-                            int maxSqlLength,
+                            SlowSqlProperties properties,
                             DatabaseTypeDetector databaseTypeDetector) {
         this.sensitiveFilter = sensitiveFilter;
         this.sqlParser = sqlParser;
-        this.maxSqlLength = maxSqlLength;
+        this.properties = properties;
         this.databaseTypeDetector = databaseTypeDetector;
     }
 
@@ -68,9 +67,10 @@ public class SqlInfoExtractor {
             sql = adaptSqlByDbType(sql, dbType);
 
             // 解析SQL（超长 SQL 跳过解析，防止解析器挂起）
+            int sqlParseMaxLength = properties.getSqlParseMaxLength();
             SqlParser.SqlParseResult parseResult;
-            if (sql.length() > SQL_PARSE_MAX_LENGTH) {
-                log.debug("SQL 长度 {} 超过解析上限 {}，跳过解析", sql.length(), SQL_PARSE_MAX_LENGTH);
+            if (sql.length() > sqlParseMaxLength) {
+                log.debug("SQL 长度 {} 超过解析上限 {}，跳过解析", sql.length(), sqlParseMaxLength);
                 parseResult = new SqlParser.SqlParseResult();
                 parseResult.setOriginalSql(sql);
                 parseResult.setSqlType(inferSqlTypeByPrefix(sql));
@@ -83,8 +83,9 @@ public class SqlInfoExtractor {
             filteredSql = WHITESPACE_PATTERN.matcher(filteredSql).replaceAll(" ").trim();
 
             // 超长截取
-            if (filteredSql.length() > maxSqlLength) {
-                filteredSql = filteredSql.substring(0, maxSqlLength) + "...";
+            int maxLen = properties.getMaxSqlLength();
+            if (filteredSql.length() > maxLen) {
+                filteredSql = filteredSql.substring(0, maxLen) + "...";
             }
 
             builder.sqlId(mappedStatement.getId())
@@ -141,7 +142,7 @@ public class SqlInfoExtractor {
     }
 
     /**
-     * 格式化参数
+     * 格式化参数（含敏感字段脱敏）
      */
     @SuppressWarnings("unchecked")
     private String formatParameter(Object parameter, BoundSql boundSql) {
@@ -159,19 +160,20 @@ public class SqlInfoExtractor {
                 if (collection.size() > 50) {
                     return "Collection(size=" + collection.size() + ")";
                 }
-                return collection.stream()
+                String result = collection.stream()
                         .map(this::safeObjectToString)
                         .collect(Collectors.joining(", ", "[", "]"));
+                return desensitizeParamString(result);
             }
 
-            return safeObjectToString(parameter);
+            return desensitizeParamString(safeObjectToString(parameter));
         } catch (Exception e) {
             return "参数格式化失败: " + e.getMessage();
         }
     }
 
     /**
-     * 格式化Map参数（过滤mybatis内部参数）
+     * 格式化Map参数（过滤mybatis内部参数，敏感字段值脱敏）
      */
     private String formatMapParameter(Map<String, Object> map) {
         if (map.size() > 50) {
@@ -182,7 +184,12 @@ public class SqlInfoExtractor {
         map.forEach((key, value) -> {
             // 过滤mybatis自动生成的参数名(param1, param2...)
             if (key != null && !MYBATIS_PARAM_PATTERN.matcher(key).matches()) {
-                filtered.put(key, safeObjectToString(value));
+                // 敏感字段值脱敏
+                if (sensitiveFilter.isSensitiveField(key)) {
+                    filtered.put(key, "****");
+                } else {
+                    filtered.put(key, safeObjectToString(value));
+                }
             }
         });
 
@@ -206,5 +213,15 @@ public class SqlInfoExtractor {
         }
         String str = obj.toString();
         return str.length() > 100 ? str.substring(0, 100) + "..." : str;
+    }
+
+    /**
+     * 对参数字符串执行手机号/身份证脱敏（复用 SqlSensitiveFilter 的能力）
+     */
+    private String desensitizeParamString(String paramStr) {
+        if (paramStr == null || !properties.getSensitive().isEnabled()) {
+            return paramStr;
+        }
+        return sensitiveFilter.filter(paramStr);
     }
 }

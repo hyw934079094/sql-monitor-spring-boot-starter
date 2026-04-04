@@ -1,5 +1,6 @@
 package com.hyw.boot.interceptor.handler;
 
+import com.hyw.boot.config.SlowSqlProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationContext;
@@ -23,13 +24,13 @@ public class DatabaseTypeDetector {
             "jdbc:(mysql|oracle|dm|postgresql|sqlserver):.*", Pattern.CASE_INSENSITIVE);
 
     private final ApplicationContext applicationContext;
-    private final int dbTypeCacheSeconds;
+    private final SlowSqlProperties properties;
 
     private volatile DatabaseTypeCache dbTypeCache;
 
-    public DatabaseTypeDetector(ApplicationContext applicationContext, int dbTypeCacheSeconds) {
+    public DatabaseTypeDetector(ApplicationContext applicationContext, SlowSqlProperties properties) {
         this.applicationContext = applicationContext;
-        this.dbTypeCacheSeconds = dbTypeCacheSeconds;
+        this.properties = properties;
     }
 
     /**
@@ -38,16 +39,22 @@ public class DatabaseTypeDetector {
     public String getDatabaseType() {
         DatabaseTypeCache cache = this.dbTypeCache;
         if (cache != null && System.currentTimeMillis() - cache.fetchTime <
-                dbTypeCacheSeconds * 1000L) {
+                properties.getDbTypeCacheSeconds() * 1000L) {
             return cache.dbType;
         }
         return refreshDbTypeCache();
     }
 
     /**
-     * 刷新数据库类型缓存
+     * 刷新数据库类型缓存（含 double-check 避免重复查询）
      */
     public synchronized String refreshDbTypeCache() {
+        // double-check: 等待获取锁后再次检查缓存是否已被其他线程刷新
+        DatabaseTypeCache cache = this.dbTypeCache;
+        if (cache != null && System.currentTimeMillis() - cache.fetchTime <
+                properties.getDbTypeCacheSeconds() * 1000L) {
+            return cache.dbType;
+        }
         String dbType = doGetDatabaseType();
         this.dbTypeCache = new DatabaseTypeCache(dbType, System.currentTimeMillis());
         return dbType;

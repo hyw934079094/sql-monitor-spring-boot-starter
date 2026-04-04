@@ -1,0 +1,170 @@
+{
+  "properties": [
+    {
+      "name": "hyw.sql.monitor.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用慢 SQL 监控，设为 false 时拦截器直接放行。",
+      "defaultValue": true
+    },
+    {
+      "name": "hyw.sql.monitor.slow-threshold",
+      "type": "java.lang.Long",
+      "description": "慢 SQL 阈值（毫秒），超过此值触发 WARN 日志和 SlowSqlHandler 回调。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "hyw.sql.monitor.critical-threshold",
+      "type": "java.lang.Long",
+      "description": "严重慢 SQL 阈值（毫秒），超过此值触发 ERROR 日志。必须 >= slow-threshold，否则自动修正为 slow-threshold × 2。",
+      "defaultValue": 5000
+    },
+    {
+      "name": "hyw.sql.monitor.log-enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用采样日志记录。关闭后仅上报 Micrometer 指标，不输出日志。",
+      "defaultValue": false
+    },
+    {
+      "name": "hyw.sql.monitor.sample-rate",
+      "type": "java.lang.Double",
+      "description": "采样率，取值 [0.0, 1.0]。基于 Murmur3 Hash 确定性采样，同一 sqlId 的采样结果恒定。",
+      "defaultValue": 0.01
+    },
+    {
+      "name": "hyw.sql.monitor.max-sql-length",
+      "type": "java.lang.Integer",
+      "description": "日志中 SQL 的最大长度（字符），超出部分截断并追加 '...'。最小值 100。",
+      "defaultValue": 2000
+    },
+    {
+      "name": "hyw.sql.monitor.max-cache-size",
+      "type": "java.lang.Integer",
+      "description": "Caffeine 缓存（Timer/Counter/Sample）的最大条目数。最小值 100。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "hyw.sql.monitor.db-type-cache-seconds",
+      "type": "java.lang.Integer",
+      "description": "数据库类型检测结果的缓存时间（秒）。最小值 1。",
+      "defaultValue": 60
+    },
+    {
+      "name": "hyw.sql.monitor.sql-parse-max-length",
+      "type": "java.lang.Integer",
+      "description": "JSqlParser 解析的最大 SQL 长度（字符），超过此值跳过解析防止解析器挂起。取值范围 [1000, 100000]。",
+      "defaultValue": 10000
+    },
+    {
+      "name": "hyw.sql.monitor.sensitive.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用 SQL 脱敏过滤（敏感字段/敏感表/手机号/身份证）。",
+      "defaultValue": true
+    },
+    {
+      "name": "hyw.sql.monitor.sensitive.mask-char",
+      "type": "java.lang.String",
+      "description": "脱敏替换字符。",
+      "defaultValue": "*"
+    },
+    {
+      "name": "hyw.sql.monitor.sensitive.mask-length",
+      "type": "java.lang.Integer",
+      "description": "脱敏时保留的前后明文长度。",
+      "defaultValue": 4
+    },
+    {
+      "name": "hyw.sql.monitor.sensitive.sensitive-fields",
+      "type": "java.util.List<java.lang.String>",
+      "description": "需要脱敏的字段名列表（大小写不敏感），匹配 SQL 中 field='value' 模式。",
+      "defaultValue": ["password", "pwd", "secret", "token", "id_card", "idcard", "phone", "mobile", "email", "bank_card", "credit_card"]
+    },
+    {
+      "name": "hyw.sql.monitor.sensitive.sensitive-tables",
+      "type": "java.util.List<java.lang.String>",
+      "description": "敏感表名列表，操作这些表时 VALUES/SET/WHERE 中的值全部脱敏。",
+      "defaultValue": ["user", "account", "payment", "customer"]
+    },
+    {
+      "name": "hyw.sql.monitor.pool.core-size",
+      "type": "java.lang.Integer",
+      "description": "SQL 监控异步线程池核心线程数。最小值 1。",
+      "defaultValue": 2
+    },
+    {
+      "name": "hyw.sql.monitor.pool.max-size",
+      "type": "java.lang.Integer",
+      "description": "SQL 监控异步线程池最大线程数。必须 >= core-size。",
+      "defaultValue": 4
+    },
+    {
+      "name": "hyw.sql.monitor.pool.queue-capacity",
+      "type": "java.lang.Integer",
+      "description": "线程池队列容量。队列满时丢弃监控任务（AbortPolicy），不阻塞业务线程。最小值 100。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "hyw.sql.monitor.pool.keep-alive-seconds",
+      "type": "java.lang.Integer",
+      "description": "非核心线程空闲存活时间（秒）。最小值 10。",
+      "defaultValue": 60
+    },
+    {
+      "name": "hyw.sql.monitor.mdc.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用 MDC 上下文传播监控。",
+      "defaultValue": true
+    },
+    {
+      "name": "hyw.sql.monitor.mdc.monitor-rate",
+      "type": "java.lang.Double",
+      "description": "MDC 传播监控采样率，取值 [0.0, 1.0]。",
+      "defaultValue": 0.01
+    },
+    {
+      "name": "hyw.sql.monitor.mdc.alert-threshold",
+      "type": "java.lang.Double",
+      "description": "MDC 传播成功率告警阈值（百分比），低于此值触发 ERROR 日志。",
+      "defaultValue": 99.5
+    },
+    {
+      "name": "hyw.sql.monitor.mdc.mdc-keys",
+      "type": "java.util.List<java.lang.String>",
+      "description": "需要监控传播的 MDC key 列表。",
+      "defaultValue": ["traceId", "spanId", "userId", "requestId", "clientIp"]
+    },
+    {
+      "name": "hyw.sql.monitor.metrics.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用 Micrometer 指标上报（Timer/Counter）。",
+      "defaultValue": false
+    },
+    {
+      "name": "hyw.sql.monitor.metrics.include-sql-id",
+      "type": "java.lang.Boolean",
+      "description": "是否将 sqlId 作为 Micrometer tag。警告：大型项目中 sqlId 可能有数千个，开启后会导致时间序列爆炸。",
+      "defaultValue": false
+    },
+    {
+      "name": "hyw.sql.monitor.metrics.percentile-histogram",
+      "type": "java.lang.Boolean",
+      "description": "是否使用服务端直方图（推荐），利于 Prometheus 跨实例聚合。",
+      "defaultValue": true
+    },
+    {
+      "name": "hyw.sql.monitor.metrics.client-percentiles",
+      "type": "double[]",
+      "description": "客户端百分位数，仅在 percentile-histogram=false 时生效。",
+      "defaultValue": [0.5, 0.95, 0.99]
+    }
+  ],
+  "hints": [
+    {
+      "name": "hyw.sql.monitor.sensitive.mask-char",
+      "values": [
+        { "value": "*", "description": "星号（默认）" },
+        { "value": "#", "description": "井号" },
+        { "value": "X", "description": "大写 X" }
+      ]
+    }
+  ]
+}
